@@ -19,7 +19,7 @@
    从本项目的 [Releases](https://github.com/dapanggougou/sensevox/releases) 页面下载最新版本的压缩包。
 
 2. **解压**
-   解压下载的压缩包至任意目录（注意：路径中请避免使用中文）。
+   解压下载的压缩包至任意目录 **(注意：路径必须全英文)**。
 
 3. **启动应用**
    运行 **神色语音sensevox.exe**。
