@@ -31,7 +31,7 @@
    - 快捷键可以是组合键。
 
 5. **最小化托盘/后台**
-   - 可使用第三方软件如 [Traymond](https://github.com/lfasmpao/traymond) 或 [RBTray](https://sourceforge.net/projects/rbtray/) 将程序最小化至托盘。
+   - 可使用第三方软件如 [Traymond](https://github.com/fcFn/traymond) 或 [RBTray](https://sourceforge.net/projects/rbtray/) 将程序最小化至托盘。
    - 使用 **Win+Tab** 或者 **触摸板多指上划** 将软件移动到另一个桌面。
 
 ## 切换录音设备
