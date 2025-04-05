@@ -16,7 +16,7 @@
 ## 使用方法
 
 1. **下载压缩包**
-   从本项目的 [Releases](https://github.com/your-username/your-repo/releases) 页面下载最新版本的压缩包。
+   从本项目的 [Releases](https://github.com/dapanggougou/sensevox/releases) 页面下载最新版本的压缩包。
 
 2. **解压**
    解压下载的压缩包至任意目录（注意：路径中请避免使用中文）。
