@@ -1,5 +1,3 @@
-# SenseVox
-
 **SenseVox**는 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), [FunASR SenseVoice](https://github.com/FunAudioLLM/SenseVoice), 그리고 [flet](https://github.com/flet-dev/flet/)을 활용한 Windows 기반 오프라인 음성 인식 도구입니다. 이 프로젝트는 사용자에게 효율적이고 편리한 오프라인 음성 인식 경험을 제공하는 것을 목표로 합니다.
 
 <img src="https://github.com/user-attachments/assets/84f46047-d144-4cc3-976b-24670f66e463" alt="예시 이미지" width="250"/>
