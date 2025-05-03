@@ -1,5 +1,3 @@
-# SenseVox
-
 **SenseVox** is an offline speech recognition tool for Windows, built using [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), [FunASR SenseVoice](https://github.com/FunAudioLLM/SenseVoice), and [flet](https://github.com/flet-dev/flet/). This project aims to provide users with an efficient and convenient offline speech recognition experience.
 
 <img src="https://github.com/user-attachments/assets/84f46047-d144-4cc3-976b-24670f66e463" alt="Sample Image" width="250"/>
