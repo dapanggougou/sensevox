@@ -1,5 +1,3 @@
-# 神色語音 SenseVox
-
 **神色語音 SenseVox** 係一款基於 Windows 嘅離線語音識別工具，用咗 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)、[FunASR SenseVoice](https://github.com/FunAudioLLM/SenseVoice) 同 [flet](https://github.com/flet-dev/flet/) 實現。呢個項目旨在為用戶提供高效、方便嘅離線語音識別體驗。
 
 <img src="https://github.com/user-attachments/assets/84f46047-d144-4cc3-976b-24670f66e463" alt="示範圖片" width="250"/>
