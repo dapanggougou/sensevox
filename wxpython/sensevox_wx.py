@@ -83,9 +83,14 @@ recognizer_stream = None
 
 class MyFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="SenseVox (wxPython)", size=(500, 450))
-
-
+        super().__init__(None, title="神色语音sensevox", size=(500, 450))
+        
+        icon_path = get_asset_path("app_icon.ico")
+        if os.path.exists(icon_path):
+            icon = wx.Icon(icon_path, wx.BITMAP_TYPE_ICO)
+            self.SetIcon(icon)
+        else:
+            print(f"Warning: Icon file not found at {icon_path}")
         self.current_hotkey = self.load_hotkey()
 
         panel = wx.Panel(self)
