@@ -7,6 +7,10 @@
 
 未来打算直接在单程序里加入sherpa-onnx的其他模型的选择配置，不只是sensevoice。
 
+日志里的识别耗时应该是有问题的，之前flet也有这个问题，实际要快得多，应该都是0.1秒上下，不应该0.2、0.3，不知道AI是怎么写的，改不了就这样吧。
+
 打包先安装依赖 `pip install numpy pyaudio keyboard sherpa-onnx wxPython`
 
 然后 `pyinstaller --windowed --name=sensevox_wx sensevox_wx.py`
+
+<img src="./sensevox_wx_image.jpg" alt="SenseVox 微信图片" width="400" />
