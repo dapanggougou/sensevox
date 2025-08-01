@@ -64,7 +64,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000 # Sherpa SenseVoice model expects 16kHz
 # ---------------------------
-MIN_RECORD_SECONDS = 0.5
+MIN_RECORD_SECONDS = 0.3
 LANG_OPTIONS = ["auto", "zh", "en", "yue", "ja", "ko"]
 DEFAULT_HOTKEY = "space"
 HOTKEY_FILE = "hotkey.txt"
