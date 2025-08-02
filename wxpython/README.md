@@ -1,6 +1,6 @@
 **感想**
 
-先用`qwen-3-235b-a22b-instruct-2507`写wxpython界面，然后让`gemini2.5pro`把flet的功能照搬过来，多模型版本由`qwen-3-coder-480b`修改。
+先用`qwen-3-235b-a22b-instruct-2507`写wxpython界面，然后让`gemini2.5pro`把flet的功能照搬过来，多模型版本由`qwen-3-coder-480b`修改，cerebras好快。
 
 wxpython优点是简洁点、流畅点、打包快得多、体积内存占用小点、也不会有flet首次启动要向回环地址联网的问题、wx代码比flet少了200多行、对ai来说wx的知识比flet多得多，面向ai友好。
 
