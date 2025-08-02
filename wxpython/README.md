@@ -13,9 +13,9 @@ FireRed模型太大了，也懒得加。
 
 安装依赖 `pip install numpy pyaudio keyboard sherpa-onnx wxPython`
 
-打包 `pyinstaller --windowed --name=sensevox_wx sensevox_wx.py`
+打包 `pyinstaller --windowed --name=神色语音sensevox sensevox_wx.py`
 
-打包多模型版 `pyinstaller --windowed --name=sensevox_wx sensevox_wx_multi_model.py`
+打包多模型版 `pyinstaller --windowed --name=神色语音sensevox sensevox_wx_multi_model.py`
 ***	
 模型下载地址：`https://huggingface.co/csukuangfj/models`
 
