@@ -13,4 +13,6 @@
 
 然后 `pyinstaller --windowed --name=sensevox_wx sensevox_wx.py`
 
-<img src="./sensevox_wx_image.jpg" alt="SenseVox 微信图片" width="400" />
+<img src="./sensevox_wx.jpg" alt="SenseVox 微信图片" width="400" />
+
+<img src="./sensevox_wx_multi_model.jpg" alt="SenseVox 微信图片" width="400" />
