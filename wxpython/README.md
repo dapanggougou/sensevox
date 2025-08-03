@@ -23,7 +23,8 @@ dolphin模型放在 dolphinmodel 文件夹
 
 paraformer模型放在 paraformermodel 文件夹
 
-sensevoice位置不变
+sensevoice模型放在 sensevoicesmallonnx 文件夹
+
 ***	
 <img src="./sensevox_wx.jpg" alt="SenseVox 微信图片" width="400" />
 
