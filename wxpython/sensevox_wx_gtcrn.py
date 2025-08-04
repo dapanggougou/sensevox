@@ -366,8 +366,9 @@ class MyFrame(wx.Frame):
             audio_np_data = (audio_np_data * 32767).clip(-32768, 32767).astype(np.int16)
             audio_bytes = audio_np_data.tobytes()
 
-            base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-            recordings_dir = os.path.join(base_dir, "录音")
+            #base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            #recordings_dir = os.path.join(base_dir, "录音")
+            recordings_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "录音")
             os.makedirs(recordings_dir, exist_ok=True)
         
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -503,4 +504,5 @@ if __name__ == '__main__':
     app = wx.App(False)
     frame = MyFrame()
     frame.Show()
+
     app.MainLoop()
