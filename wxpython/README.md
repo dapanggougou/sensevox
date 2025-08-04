@@ -26,6 +26,8 @@ paraformer模型放在 paraformermodel 文件夹
 sensevoice模型放在 sensevoicesmallonnx 文件夹
 
 ***	
-<img src="./sensevox_wx.jpg" alt="SenseVox 微信图片" width="400" />
-
-<img src="./sensevox_wx_multi_model.jpg" alt="SenseVox 微信图片" width="400" />
+<div align="center">
+  <img src="./images/sensevox_wx.jpg" alt="wx" width="250" />
+  <img src="./images/sensevox_wx_multi_model.jpg" alt="multi_model" width="250" />
+  <img src="./images/sensevox_wx_gtcrn.jpg" alt="gtcrn" width="234" />
+</div>
