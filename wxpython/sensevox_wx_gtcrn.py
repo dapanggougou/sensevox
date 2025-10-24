@@ -8,14 +8,14 @@ import datetime
 import re
 import traceback
 import wave
+import pyperclip
 from collections import deque
 
-# 检查和导入可选库
 try:
-    import pyaudio
-    PYAUDIO_AVAILABLE = True
+    import miniaudio
+    MINIAUDIO_AVAILABLE = True
 except ImportError:
-    PYAUDIO_AVAILABLE = False
+    MINIAUDIO_AVAILABLE = False
 
 try:
     import keyboard
@@ -37,7 +37,6 @@ except ImportError:
 
 import numpy as np
 
-# --- DPI Awareness ---
 try:
     ctypes.windll.shcore.SetProcessDpiAwarenessContext(-4)
 except (AttributeError, OSError):
@@ -49,16 +48,18 @@ except (AttributeError, OSError):
         except (AttributeError, OSError):
             pass
 
-# --- 资源路径管理 ---
+
 def get_asset_path(relative_path):
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         base_path = sys._MEIPASS
     else:
-        try: base_path = os.path.dirname(os.path.abspath(__file__))
-        except NameError: base_path = os.path.abspath(".")
+        try:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            base_path = os.path.abspath(".")
     return os.path.join(base_path, "assets", relative_path)
 
-# --- 常量定义 ---
+
 MODEL_DIR_BASE = "sensevoicesmallonnx"
 MODEL_DIR = get_asset_path(MODEL_DIR_BASE)
 MODEL_FILENAME = "model.onnx"
@@ -68,15 +69,14 @@ TOKENS_FILE_PATH = os.path.join(MODEL_DIR, TOKENS_FILENAME)
 GTCRN_MODEL_PATH = get_asset_path("gtcrn_simple.onnx")
 
 CHUNK = 1024 * 2
-FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
+SAMPLE_WIDTH_BYTES = 2
 MIN_RECORD_SECONDS = 0.3
 DEFAULT_HOTKEY = "space"
 MAX_FILENAME_TEXT_LEN = 15
 all_punctuation = '''!"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~，。、！？：；（）【】「」『』“”‘’·～《》〈〉﹏——……〜・〝〟‹›'''
 
-# --- 配置文件路径 ---
 HOTKEY_FILE = "hotkey.txt"
 GTCRN_CONFIG_FILE = "gtcrn_config.txt"
 SAVE_RECORDING_CONFIG_FILE = "save_recording_config.txt"
@@ -89,7 +89,6 @@ SAVE_RECORDING_CONFIG_PATH = get_asset_path(SAVE_RECORDING_CONFIG_FILE)
 OPENCC_CONFIG_PATH = get_asset_path(OPENCC_CONFIG_FILE)
 OPENCC_ENABLED_PATH = get_asset_path(OPENCC_ENABLED_FILE)
 
-# --- OpenCC 配置选项 ---
 OPENCC_OPTIONS = [
     "s2t.json 簡 → 繁", "t2s.json 繁 → 簡", "s2tw.json 簡 → 臺灣繁",
     "tw2s.json 臺灣繁 → 簡", "s2hk.json 簡 → 香港繁", "hk2s.json 香港繁 → 簡",
@@ -98,37 +97,129 @@ OPENCC_OPTIONS = [
     "t2jp.json 繁 → 日文新字體", "jp2t.json 日文新字體 → 繁", "tw2t.json 臺灣繁 → 繁"
 ]
 
-# --- 全局变量 (用于线程控制) ---
-is_listening = False
-is_capturing_hotkey = False
-listener_thread = None
-capture_thread = None
 
-# --- 新增：自定义异常，用于信号传递 ---
 class AudioDeviceError(Exception):
-    """用于表示严重音频设备错误的自定义异常。"""
     pass
+
+
+class PyMiniaudioRecorder:
+    def __init__(self, device_index=-1, frame_length=CHUNK, stall_timeout=1.0, max_queue_chunks=128):
+        self.device_index = device_index
+        self.frame_length = frame_length
+        self.sample_rate = RATE
+        self.channels = CHANNELS
+        self.sample_width = SAMPLE_WIDTH_BYTES
+        self.dev = None
+        self.buffer = bytearray()
+        self.queue = deque()
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.running = False
+        self._gen = None
+        self.received_data = False
+        self.last_data_time = 0.0
+        self.stall_timeout = stall_timeout
+        self.max_queue_chunks = max_queue_chunks
+
+    def _capture_generator(self):
+        _ = (yield)
+        chunk_bytes = self.frame_length * self.channels * self.sample_width
+        while True:
+            data = (yield)
+            if not data:
+                continue
+            with self.lock:
+                self.buffer.extend(data)
+                while len(self.buffer) >= chunk_bytes:
+                    chunk = bytes(self.buffer[:chunk_bytes])
+                    del self.buffer[:chunk_bytes]
+                    self.queue.append(chunk)
+                    if len(self.queue) > self.max_queue_chunks:
+                        self.queue.popleft()
+                self.received_data = True
+                self.last_data_time = time.monotonic()
+                self.cond.notify_all()
+
+    def start(self):
+        if self.running:
+            return
+        self.buffer = bytearray()
+        self.queue = deque()
+        self.running = True
+        self.received_data = False
+        self.last_data_time = time.monotonic()
+        bs_msec = max(1, int(self.frame_length * 1000 / self.sample_rate))
+        self.dev = miniaudio.CaptureDevice(
+            input_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=self.channels,
+            sample_rate=self.sample_rate,
+            buffersize_msec=bs_msec
+        )
+        self._gen = self._capture_generator()
+        next(self._gen)
+        self.dev.start(self._gen)
+
+    def stop(self):
+        if self.dev:
+            try:
+                self.dev.stop()
+            except Exception:
+                pass
+            try:
+                self.dev.close()
+            except Exception:
+                pass
+            self.dev = None
+        with self.lock:
+            self.running = False
+            self.cond.notify_all()
+        self._gen = None
+
+    def wait_ready(self, timeout=1.0):
+        end = time.monotonic() + timeout
+        with self.lock:
+            while self.running and not self.received_data:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.cond.wait(timeout=min(0.1, remaining))
+            return self.received_data
+
+    def read(self):
+        with self.lock:
+            waited = 0.0
+            while self.running and len(self.queue) == 0:
+                self.cond.wait(timeout=0.1)
+                waited += 0.1
+                if self.received_data and (time.monotonic() - self.last_data_time) > self.stall_timeout:
+                    raise AudioDeviceError("Audio device stalled")
+                if not self.received_data and waited >= self.stall_timeout:
+                    raise AudioDeviceError("No audio received")
+            if len(self.queue) == 0:
+                return np.zeros(self.frame_length, dtype=np.int16).tobytes()
+            return self.queue.popleft()
+
+    def delete(self):
+        pass
+
 
 class MyFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title="神色语音sensevox", size=(500, 520))
-
-        # --- 将全局变量转换为实例变量 ---
-        self.p = None
-        self.audio_stream = None
+        self.recorder = None
         self.model = None
         self.gtcrn_denoiser = None
         self.recognizer_stream = None
         self.opencc_converter = None
-        # ---
+        self.listening_event = threading.Event()
+        self.capturing_hotkey_event = threading.Event()
+        self.listener_thread = None
+        self.capture_thread = None
 
         icon_path = get_asset_path("app_icon.ico")
         if os.path.exists(icon_path):
             self.SetIcon(wx.Icon(icon_path, wx.BITMAP_TYPE_ICO))
-        else:
-            print(f"Warning: Icon file not found at {icon_path}")
 
-        # 加载持久化设置
         self.current_hotkey = self.load_setting(HOTKEY_FILE_PATH, DEFAULT_HOTKEY)
         initial_gtcrn_state = self.load_setting(GTCRN_CONFIG_PATH, "true").lower() == "true"
         initial_save_state = self.load_setting(SAVE_RECORDING_CONFIG_PATH, "true").lower() == "true"
@@ -139,12 +230,16 @@ class MyFrame(wx.Frame):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         grid_sizer = wx.FlexGridSizer(rows=1, cols=3, hgap=8, vgap=8)
-        grid_sizer.AddGrowableCol(0, 1); grid_sizer.AddGrowableCol(1, 1); grid_sizer.AddGrowableCol(2, 1)
+        grid_sizer.AddGrowableCol(0, 1)
+        grid_sizer.AddGrowableCol(1, 1)
+        grid_sizer.AddGrowableCol(2, 1)
 
         self.btn_start = wx.Button(panel, label="Start 启动")
         self.btn_stop = wx.Button(panel, label="Stop 暂停")
         self.btn_hotkey = wx.Button(panel, label=f"Hotkey: {self.current_hotkey}")
-        for btn in [self.btn_start, self.btn_stop, self.btn_hotkey]: btn.SetMinSize((-1, 34))
+        for btn in [self.btn_start, self.btn_stop, self.btn_hotkey]:
+            btn.SetMinSize((-1, 34))
+
         grid_sizer.Add(self.btn_start, 0, wx.EXPAND | wx.ALL, 2)
         grid_sizer.Add(self.btn_stop, 0, wx.EXPAND | wx.ALL, 2)
         grid_sizer.Add(self.btn_hotkey, 0, wx.EXPAND | wx.ALL, 2)
@@ -161,7 +256,7 @@ class MyFrame(wx.Frame):
         self.chk_gtcrn_enhance = wx.CheckBox(panel, label="GTCRN 增强 (需要 assets/gtcrn_simple.onnx)")
         self.chk_gtcrn_enhance.SetValue(initial_gtcrn_state)
         main_sizer.Add(self.chk_gtcrn_enhance, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
-    
+
         self.chk_save_recording = wx.CheckBox(panel, label="保存录音 (保存在 '录音' 文件夹)")
         self.chk_save_recording.SetValue(initial_save_state)
         main_sizer.Add(self.chk_save_recording, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
@@ -169,8 +264,7 @@ class MyFrame(wx.Frame):
         opencc_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.chk_opencc = wx.CheckBox(panel, label="OpenCC")
         self.chk_opencc.SetValue(initial_opencc_state)
-        self.combo_opencc = wx.ComboBox(panel, value=initial_opencc_config, 
-                                       choices=OPENCC_OPTIONS, style=wx.CB_READONLY)
+        self.combo_opencc = wx.ComboBox(panel, value=initial_opencc_config, choices=OPENCC_OPTIONS, style=wx.CB_READONLY)
         opencc_sizer.Add(self.chk_opencc, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
         opencc_sizer.Add(self.combo_opencc, 1, wx.EXPAND)
         main_sizer.Add(opencc_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
@@ -178,17 +272,20 @@ class MyFrame(wx.Frame):
         self.log_text = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
         self.log_text.SetFont(wx.Font(10, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
         main_sizer.Add(self.log_text, 1, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
-    
+
         bottom_grid = wx.FlexGridSizer(rows=1, cols=2, hgap=8, vgap=8)
-        bottom_grid.AddGrowableCol(0, 1); bottom_grid.AddGrowableCol(1, 1)
+        bottom_grid.AddGrowableCol(0, 1)
+        bottom_grid.AddGrowableCol(1, 1)
         self.btn_clear_log = wx.Button(panel, label="Clear 清除日志")
         self.btn_copy_log = wx.Button(panel, label="Copy 复制日志")
-        for btn in [self.btn_clear_log, self.btn_copy_log]: btn.SetMinSize((-1, 34))
+        for btn in [self.btn_clear_log, self.btn_copy_log]:
+            btn.SetMinSize((-1, 34))
         bottom_grid.Add(self.btn_clear_log, 0, wx.EXPAND | wx.ALL, 2)
         bottom_grid.Add(self.btn_copy_log, 0, wx.EXPAND | wx.ALL, 2)
         main_sizer.Add(bottom_grid, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
-    
+
         panel.SetSizer(main_sizer)
+
         self.BindEvents()
         self.SetMinSize((450, 520))
         self.Centre()
@@ -209,10 +306,22 @@ class MyFrame(wx.Frame):
     def log(self, message, level="INFO"):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         log_entry = f"[{timestamp} {level}] {message}\n"
-        wx.CallAfter(self.log_text.AppendText, log_entry)
+
+        def append_and_prune():
+            self.log_text.AppendText(log_entry)
+            max_lines = 100
+            lines = self.log_text.GetNumberOfLines()
+            if lines > max_lines:
+                extra = lines - max_lines
+                end_pos = self.log_text.XYToPosition(0, extra)
+                if end_pos != wx.NOT_FOUND and end_pos > 0:
+                    self.log_text.Remove(0, end_pos)
+
+        wx.CallAfter(append_and_prune)
 
     def update_ui_state(self):
-        global is_listening, is_capturing_hotkey
+        is_listening = self.listening_event.is_set()
+        is_capturing_hotkey = self.capturing_hotkey_event.is_set()
         is_running_or_capturing = is_listening or is_capturing_hotkey
         self.btn_start.Enable(not is_running_or_capturing)
         self.btn_stop.Enable(is_listening and not is_capturing_hotkey)
@@ -222,58 +331,44 @@ class MyFrame(wx.Frame):
         self.chk_save_recording.Enable(not is_running_or_capturing)
         self.chk_opencc.Enable(not is_running_or_capturing and OPENCC_AVAILABLE)
         self.combo_opencc.Enable(not is_running_or_capturing and self.chk_opencc.IsChecked() and OPENCC_AVAILABLE)
-        
-        if is_capturing_hotkey: self.btn_hotkey.SetLabel("Capturing...")
-        else: self.btn_hotkey.SetLabel(f"Hotkey: {self.current_hotkey}")
+        if is_capturing_hotkey:
+            self.btn_hotkey.SetLabel("Capturing...")
+        else:
+            self.btn_hotkey.SetLabel(f"Hotkey: {self.current_hotkey}")
 
-    # --- 新增：封装音频系统初始化 ---
     def _initialize_audio_system(self):
-        self.log("Initializing PyAudio...", "INFO")
+        self.log("Initializing PyMiniaudio...", "INFO")
         try:
-            self.p = pyaudio.PyAudio()
-            self.log("Opening PyAudio stream...", "INFO")
-            self.audio_stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
-                                            frames_per_buffer=CHUNK, start=False)
-            self.audio_stream.start_stream()
+            self.recorder = PyMiniaudioRecorder(device_index=-1, frame_length=CHUNK)
+            self.recorder.start()
+            if not self.recorder.wait_ready(timeout=1.0):
+                raise AudioDeviceError("No audio input detected")
             return True
         except Exception as e:
             self.log(f"Failed to initialize audio system: {e}", "ERROR")
-            self._cleanup_audio_resources() # 确保部分成功的资源被清理
+            self._cleanup_audio_resources()
             return False
 
-    # --- 新增：封装音频资源清理 ---
     def _cleanup_audio_resources(self):
-        if self.audio_stream:
+        if self.recorder:
             try:
-                if self.audio_stream.is_active(): self.audio_stream.stop_stream()
-                self.audio_stream.close()
+                self.recorder.stop()
             except Exception as e:
-                self.log(f"Error closing audio stream: {e}", "WARNING")
+                self.log(f"Error stopping recorder: {e}", "WARNING")
             finally:
-                self.audio_stream = None
-        if self.p:
-            try:
-                self.p.terminate()
-            except Exception as e:
-                self.log(f"Error terminating PyAudio: {e}", "WARNING")
-            finally:
-                self.p = None
+                self.recorder = None
         self.log("Audio resources cleaned up.", "DEBUG")
 
     def on_start_listening(self, event):
-        global is_listening, listener_thread
         if not self.run_initial_checks():
             wx.MessageBox("Initial checks failed. Please see the log for details.", "Error", wx.OK | wx.ICON_ERROR)
             return
-        if is_listening:
+        if self.listening_event.is_set():
             self.log("Listener already running.", "WARNING")
             return
-        
-        # 使用新的辅助函数初始化音频
         if not self._initialize_audio_system():
             self.update_ui_state()
             return
-
         if self.model is None:
             self.log("Loading Sherpa-ONNX recognizer...", "INFO")
             try:
@@ -289,7 +384,6 @@ class MyFrame(wx.Frame):
                 self._cleanup_audio_resources()
                 self.update_ui_state()
                 return
-
         if self.chk_gtcrn_enhance.IsChecked() and os.path.exists(GTCRN_MODEL_PATH):
             self.log("Loading GTCRN denoiser model...", "INFO")
             try:
@@ -303,7 +397,6 @@ class MyFrame(wx.Frame):
             except Exception as e:
                 self.log(f"Failed to load GTCRN denoiser: {e}", "ERROR")
                 self.gtcrn_denoiser = None
-        
         if self.chk_opencc.IsChecked() and OPENCC_AVAILABLE:
             try:
                 selected_config = self.combo_opencc.GetValue().split()[0]
@@ -312,66 +405,56 @@ class MyFrame(wx.Frame):
             except Exception as e:
                 self.log(f"Failed to initialize OpenCC converter: {e}", "ERROR")
                 self.opencc_converter = None
-        
-        is_listening = True
+        self.listening_event.set()
         self.log(f"Starting listener thread (Hotkey: '{self.current_hotkey}')...", "INFO")
-        listener_thread = threading.Thread(target=self.listen_loop, daemon=True)
-        listener_thread.start()
+        self.listener_thread = threading.Thread(target=self.listen_loop, daemon=True)
+        self.listener_thread.start()
         self.update_ui_state()
 
     def on_stop_listening(self, event):
-        global is_listening, listener_thread
-        if not is_listening: return
+        if not self.listening_event.is_set():
+            return
         self.log("Stopping listener...", "INFO")
-        is_listening = False # 首先设置标志
-        if listener_thread and listener_thread.is_alive():
-            listener_thread.join(timeout=2.0) # 等待线程自然退出
-        
+        self.listening_event.clear()
+        if self.listener_thread and self.listener_thread.is_alive():
+            self.listener_thread.join(timeout=2.0)
         self._cleanup_audio_resources()
         self.gtcrn_denoiser = None
         self.opencc_converter = None
         self.log("Listener stopped and resources released.", "INFO")
         self.update_ui_state()
 
-    # --- 修改：核心监听循环，包含重连逻辑 ---
     def listen_loop(self):
-        global is_listening
-
         MAX_RETRIES = 5
         RETRY_DELAY_SECONDS = 2
-
         self.log(f"Listener thread started. Monitoring hotkey: '{self.current_hotkey}'.")
-        while is_listening:
+        while self.listening_event.is_set():
             try:
                 self.perform_record_and_transcribe()
                 time.sleep(0.02)
             except AudioDeviceError as e:
-                if not is_listening: break # 如果是手动停止，则不重连
-                
+                if not self.listening_event.is_set():
+                    break
                 self.log(f"Audio device error: {e}. Starting reconnection procedure.", "ERROR")
-                self._cleanup_audio_resources() # 清理损坏的流
-
+                self._cleanup_audio_resources()
                 reconnected = False
                 for i in range(MAX_RETRIES):
-                    if not is_listening: break # 再次检查，可能在等待时被停止
+                    if not self.listening_event.is_set():
+                        break
                     self.log(f"Reconnect attempt {i + 1}/{MAX_RETRIES} in {RETRY_DELAY_SECONDS} seconds...")
                     time.sleep(RETRY_DELAY_SECONDS)
-                    
                     if self._initialize_audio_system():
                         self.log("Reconnection successful.", "SUCCESS")
                         reconnected = True
-                        break # 成功，跳出重试循环
+                        break
                     else:
                         self.log(f"Reconnect attempt {i + 1} failed.", "WARNING")
-                
-                if not reconnected and is_listening:
+                if not reconnected and self.listening_event.is_set():
                     self.log(f"Failed to reconnect after {MAX_RETRIES} attempts. Stopping listener.", "ERROR")
-                    # 从工作线程安全地调用UI线程的方法
                     wx.CallAfter(self.on_stop_listening, None)
-                    break # 退出主监听循环
-
+                    break
             except Exception as e:
-                if is_listening:
+                if self.listening_event.is_set():
                     self.log(f"Unhandled error in listener loop: {e}", "ERROR")
                     traceback.print_exc()
                 break
@@ -381,14 +464,12 @@ class MyFrame(wx.Frame):
         blocked_keys = []
         hotkey_parts = [part.strip() for part in self.current_hotkey.split('+')]
         is_caps_lock_hotkey = (self.current_hotkey.lower() == 'caps lock')
-
         try:
             raw_audio_data, duration = self.record_audio(hotkey_parts, blocked_keys)
-        
-            if raw_audio_data and is_listening:
-                transcription_result, audio_for_saving = self.transcribe_local(raw_audio_data)
-            
-                if transcription_result and "Transcription failed:" not in transcription_result:
+            if raw_audio_data and self.listening_event.is_set():
+                ok, transcription_result, audio_for_saving = self.transcribe_local(raw_audio_data)
+                self._unblock_keys(blocked_keys)
+                if ok and transcription_result:
                     processed_text = self.process_text(transcription_result)
                     if self.chk_opencc.IsChecked() and OPENCC_AVAILABLE and self.opencc_converter:
                         try:
@@ -398,38 +479,35 @@ class MyFrame(wx.Frame):
                             self.log(f"OpenCC conversion failed: {e}", "ERROR")
                     self.type_text(processed_text)
                     if is_caps_lock_hotkey:
-                        try: keyboard.press_and_release('caps lock')
-                        except Exception as e: self.log(f"Failed to toggle Caps Lock state: {e}", "WARNING")
-            
+                        try:
+                            keyboard.press_and_release('caps lock')
+                        except Exception as e:
+                            self.log(f"Failed to toggle Caps Lock state: {e}", "WARNING")
                 if self.chk_save_recording.IsChecked():
-                    self.save_audio_with_transcription(audio_for_saving, transcription_result, self.p)
-
+                    self.save_audio_with_transcription(audio_for_saving, transcription_result)
         except AudioDeviceError:
-            raise # 将音频设备错误重新抛出，由 listen_loop 处理
+            raise
         except Exception as e:
-            if is_listening:
+            if self.listening_event.is_set():
                 self.log(f"Error during record/process cycle: {e}", "ERROR")
                 traceback.print_exc()
         finally:
-            if blocked_keys:
-                for key_part in blocked_keys:
-                    try: keyboard.unblock_key(key_part)
-                    except Exception: pass
+            self._unblock_keys(blocked_keys)
 
-    # --- 修改：音频录制函数，现在会抛出自定义异常 ---
     def record_audio(self, hotkey_parts, blocked_keys_list):
-        global is_listening
         frames = deque()
         recording_started = False
         start_time = 0
         hotkey = self.current_hotkey
         is_caps_lock_hotkey = (hotkey.lower() == 'caps lock')
-        
-        while is_listening:
+        tail_chunks = 1
+
+        while self.listening_event.is_set():
             try:
-                # 使用 exception_on_overflow=True 使其在溢出时抛出 IOError
-                data = self.audio_stream.read(CHUNK, exception_on_overflow=True)
-                if keyboard.is_pressed(hotkey):
+                samples_bytes = self.recorder.read()
+                pressed = KEYBOARD_AVAILABLE and keyboard.is_pressed(hotkey)
+
+                if pressed:
                     if not recording_started:
                         self.log(f"Recording started (hotkey '{hotkey}' detected)...", "DEBUG")
                         start_time = time.time()
@@ -441,31 +519,38 @@ class MyFrame(wx.Frame):
                                     blocked_keys_list.append(key_part)
                                 except Exception as e:
                                     self.log(f"Could not block '{key_part}': {e}", "WARNING")
-                    frames.append(data)
+                    frames.append(samples_bytes)
                 elif recording_started:
+                    frames.append(samples_bytes)
+                    for _ in range(tail_chunks):
+                        try:
+                            extra = self.recorder.read()
+                            frames.append(extra)
+                        except Exception:
+                            break
                     break
-            except IOError as e:
-                # 捕获到IOError，抛出我们自定义的异常，信号给上层处理
-                raise AudioDeviceError(str(e))
+
+            except AudioDeviceError:
+                raise
             except Exception as e:
-                # 其他异常也可能意味着流有问题
                 self.log(f"Unexpected error reading audio stream: {e}", "ERROR")
                 raise AudioDeviceError(f"Unexpected stream error: {e}")
 
-        if not recording_started: return None, 0.0
+        if not recording_started:
+            return None, 0.0
+
         duration = time.time() - start_time
-        if duration < MIN_RECORD_SECONDS and is_listening:
+        if duration < MIN_RECORD_SECONDS and self.listening_event.is_set():
             self.log(f"Recording too short ({duration:.2f}s), ignored.", "WARNING")
             return None, duration
+
         return b''.join(frames), duration
 
     def transcribe_local(self, audio_input_bytes):
         if not self.model or not SHERPA_AVAILABLE:
-            return "Recognizer unavailable.", np.array([])
-
+            return False, None, np.frombuffer(audio_input_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         original_audio_np = np.frombuffer(audio_input_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         audio_for_transcription = original_audio_np
-    
         use_gtcrn = self.chk_gtcrn_enhance.IsChecked() and self.gtcrn_denoiser is not None
         if use_gtcrn:
             self.log("Applying GTCRN enhancement...", "DEBUG")
@@ -477,9 +562,8 @@ class MyFrame(wx.Frame):
             except Exception as e:
                 self.log(f"GTCRN enhancement failed: {e}. Using original audio.", "ERROR")
         else:
-             if self.chk_save_recording.IsChecked():
+            if self.chk_save_recording.IsChecked():
                 self.log("GTCRN not used. Saving original audio.", "INFO")
-
         self.recognizer_stream = self.model.create_stream()
         start_time = time.perf_counter()
         try:
@@ -490,33 +574,30 @@ class MyFrame(wx.Frame):
             transcribed_text = self.recognizer_stream.result.text
         except Exception as e:
             self.log(f"Sherpa-ONNX transcription error: {e}", "ERROR")
-            return f"Transcription failed: {e}", original_audio_np
-
+            return False, None, original_audio_np
         duration = time.perf_counter() - start_time
         self.log(f"识别完成 ({duration:.2f}s): '{transcribed_text}'", "INFO")
-        return (transcribed_text if transcribed_text else None), audio_for_transcription
+        if transcribed_text:
+            return True, transcribed_text, audio_for_transcription
+        return False, None, audio_for_transcription
 
-    def save_audio_with_transcription(self, audio_np_data, transcription, pyaudio_instance):
-        if audio_np_data is None or audio_np_data.size == 0 or pyaudio_instance is None: 
-            self.log("Audio data or PyAudio instance is empty, skipping save.", "WARNING")
+    def save_audio_with_transcription(self, audio_np_data, transcription):
+        if audio_np_data is None or (hasattr(audio_np_data, "size") and audio_np_data.size == 0):
+            self.log("Audio data is empty, skipping save.", "WARNING")
             return
         try:
             audio_np_data = (audio_np_data * 32767).clip(-32768, 32767).astype(np.int16)
             audio_bytes = audio_np_data.tobytes()
-
             recordings_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "录音")
             os.makedirs(recordings_dir, exist_ok=True)
-        
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             sanitized_text = self.sanitize_filename_part(transcription)
-        
             enh_tag = "_enhanced" if self.chk_gtcrn_enhance.IsChecked() else ""
             filename = f"rec_{timestamp}{enh_tag}_{sanitized_text}.wav" if sanitized_text else f"rec_{timestamp}{enh_tag}.wav"
             filepath = os.path.join(recordings_dir, filename)
-
             with wave.open(filepath, 'wb') as wf:
                 wf.setnchannels(CHANNELS)
-                wf.setsampwidth(pyaudio_instance.get_sample_size(FORMAT))
+                wf.setsampwidth(SAMPLE_WIDTH_BYTES)
                 wf.setframerate(RATE)
                 wf.writeframes(audio_bytes)
             self.log(f"Recording saved: {os.path.basename(filepath)}", "INFO")
@@ -527,55 +608,69 @@ class MyFrame(wx.Frame):
     def run_initial_checks(self):
         self.log("Running initial checks...", "INFO")
         all_ok = True
-        if not SHERPA_AVAILABLE: self.log("Sherpa-ONNX library not found.", "ERROR"); all_ok = False
-        if not PYAUDIO_AVAILABLE: self.log("PyAudio library not found.", "ERROR"); all_ok = False
-        if not KEYBOARD_AVAILABLE: self.log("Keyboard library not found or permission error.", "ERROR"); all_ok = False
-        if not os.path.isfile(MODEL_FILE_PATH): self.log(f"Model file not found: {MODEL_FILE_PATH}", "ERROR"); all_ok = False
-        if not os.path.isfile(TOKENS_FILE_PATH): self.log(f"Tokens file not found: {TOKENS_FILE_PATH}", "ERROR"); all_ok = False
+        if not SHERPA_AVAILABLE:
+            self.log("Sherpa-ONNX library not found.", "ERROR")
+            all_ok = False
+        if not MINIAUDIO_AVAILABLE:
+            self.log("Miniaudio library not found.", "ERROR")
+            all_ok = False
+        if not KEYBOARD_AVAILABLE:
+            self.log("Keyboard library not found or permission error.", "ERROR")
+            all_ok = False
+        if not os.path.isfile(MODEL_FILE_PATH):
+            self.log(f"Model file not found: {MODEL_FILE_PATH}", "ERROR")
+            all_ok = False
+        if not os.path.isfile(TOKENS_FILE_PATH):
+            self.log(f"Tokens file not found: {TOKENS_FILE_PATH}", "ERROR")
+            all_ok = False
         if not os.path.exists(GTCRN_MODEL_PATH):
             self.log("GTCRN model (gtcrn_simple.onnx) not found in assets. Enhancement disabled.", "WARNING")
-            self.chk_gtcrn_enhance.SetValue(False); self.chk_gtcrn_enhance.Disable()
+            self.chk_gtcrn_enhance.SetValue(False)
+            self.chk_gtcrn_enhance.Disable()
         else:
-            self.log("GTCRN model found. Enhancement option is available.", "INFO"); self.chk_gtcrn_enhance.Enable()
-        
+            self.log("GTCRN model found. Enhancement option is available.", "INFO")
+            self.chk_gtcrn_enhance.Enable()
         if not OPENCC_AVAILABLE:
             self.log("OpenCC library not found. Conversion feature disabled.", "WARNING")
-            self.chk_opencc.SetValue(False); self.chk_opencc.Disable(); self.combo_opencc.Disable()
+            self.chk_opencc.SetValue(False)
+            self.chk_opencc.Disable()
+            self.combo_opencc.Disable()
         else:
             self.log("OpenCC library found. Conversion feature is available.", "INFO")
-            self.chk_opencc.Enable(); self.combo_opencc.Enable(self.chk_opencc.IsChecked())
-            
-        if all_ok: self.log("All critical checks passed. Ready to start.", "SUCCESS")
-        else: self.log("One or more critical checks failed. Please resolve the errors.", "ERROR")
+            self.chk_opencc.Enable()
+            self.combo_opencc.Enable(self.chk_opencc.IsChecked())
+        if all_ok:
+            self.log("All critical checks passed. Ready to start.", "SUCCESS")
+        else:
+            self.log("One or more critical checks failed. Please resolve the errors.", "ERROR")
         return all_ok
 
     def on_close(self, event):
-        global is_listening, listener_thread
         self.log("Window closing, saving settings and cleaning up...", "INFO")
-      
         self.save_setting(HOTKEY_FILE_PATH, self.current_hotkey)
         self.save_setting(GTCRN_CONFIG_PATH, self.chk_gtcrn_enhance.IsChecked())
         self.save_setting(SAVE_RECORDING_CONFIG_PATH, self.chk_save_recording.IsChecked())
         self.save_setting(OPENCC_ENABLED_PATH, self.chk_opencc.IsChecked())
         self.save_setting(OPENCC_CONFIG_PATH, self.combo_opencc.GetValue())
-      
-        is_listening = False
-        if listener_thread and listener_thread.is_alive(): listener_thread.join(timeout=1.0)
+        self.listening_event.clear()
+        if self.listener_thread and self.listener_thread.is_alive():
+            self.listener_thread.join(timeout=1.0)
         if KEYBOARD_AVAILABLE:
-            try: keyboard.unhook_all()
-            except Exception: pass
-        
+            try:
+                keyboard.unhook_all()
+            except Exception:
+                pass
         self._cleanup_audio_resources()
         self.Destroy()
 
     def on_set_hotkey(self, event):
-        global is_capturing_hotkey, capture_thread
-        if is_capturing_hotkey: return
-        is_capturing_hotkey = True
+        if self.capturing_hotkey_event.is_set():
+            return
+        self.capturing_hotkey_event.set()
         self.update_ui_state()
         self.log("Hotkey capture active. Press desired key/combination...", "INFO")
-        capture_thread = threading.Thread(target=self.capture_hotkey_thread_func, daemon=True)
-        capture_thread.start()
+        self.capture_thread = threading.Thread(target=self.capture_hotkey_thread_func, daemon=True)
+        self.capture_thread.start()
 
     def on_combo_select(self, event):
         self.current_language = self.combo_box.GetValue()
@@ -603,15 +698,52 @@ class MyFrame(wx.Frame):
             self.log("Logs copied to clipboard.", "SUCCESS")
 
     def type_text(self, text_to_type):
-        if not text_to_type: return
+        if not text_to_type:
+            return
+        
         try:
-            keyboard.write(text_to_type)
-            self.log(f"Typed: '{text_to_type}'", "SUCCESS")
+            if sys.platform == "win32":
+                keyboard.write(text_to_type)
+                self.log(f"Typed: '{text_to_type}'", "SUCCESS")
+                
+            elif sys.platform.startswith("linux"):
+                original_clipboard = pyperclip.paste()
+                pyperclip.copy(text_to_type)
+                time.sleep(0.1)
+                keyboard.press_and_release('shift+insert')
+                time.sleep(0.1)
+                pyperclip.copy(original_clipboard)
+                self.log(f"Typed (Linux): '{text_to_type}'", "SUCCESS")
+            elif sys.platform == "darwin":
+                original_clipboard = pyperclip.paste()
+                pyperclip.copy(text_to_type)
+                time.sleep(0.1)
+                keyboard.press_and_release('command+v')
+                time.sleep(0.1)
+                pyperclip.copy(original_clipboard)
+                self.log(f"Typed (Mac): '{text_to_type}'", "SUCCESS")
+                
+            else:
+                keyboard.write(text_to_type)
+                self.log(f"Typed (Unknown OS): '{text_to_type}'", "SUCCESS")
+                
         except Exception as e:
             self.log(f"Keyboard input failed: {e}", "ERROR")
 
+    def _unblock_keys(self, keys):
+        if not KEYBOARD_AVAILABLE:
+            return
+        seen = set()
+        for key_part in keys:
+            if key_part in seen:
+                continue
+            seen.add(key_part)
+            try:
+                keyboard.unblock_key(key_part)
+            except Exception:
+                pass
+
     def capture_hotkey_thread_func(self):
-        global is_capturing_hotkey
         try:
             new_hotkey = keyboard.read_hotkey(suppress=False)
             if len(new_hotkey) > 30:
@@ -623,7 +755,7 @@ class MyFrame(wx.Frame):
         except Exception as e:
             self.log(f"Hotkey capture failed: {e}", "ERROR")
         finally:
-            is_capturing_hotkey = False
+            self.capturing_hotkey_event.clear()
             wx.CallAfter(self.update_ui_state)
 
     def load_setting(self, file_path, default_value):
@@ -646,16 +778,20 @@ class MyFrame(wx.Frame):
             self.log(f"Failed to save setting to {os.path.basename(file_path)}: {e}", "ERROR")
 
     def process_text(self, text):
-        if not isinstance(text, str): return text
+        if not isinstance(text, str):
+            return text
         punctuation_count = sum(1 for char in text if char in all_punctuation)
-        if punctuation_count <= 1: return text.translate(str.maketrans('', '', all_punctuation))
+        if punctuation_count <= 1:
+            return text.translate(str.maketrans('', '', all_punctuation))
         return text
 
     def sanitize_filename_part(self, text, max_len=MAX_FILENAME_TEXT_LEN):
-        if not text or not isinstance(text, str): return ""
+        if not text or not isinstance(text, str):
+            return ""
         sanitized = re.sub(r'[\\/*?:"<>|\n\r\t]+', '', text)
         sanitized = re.sub(r'\s+', '_', sanitized).strip('_')
         return sanitized[:max_len].strip('_') if len(sanitized) > max_len else sanitized
+
 
 if __name__ == '__main__':
     app = wx.App(False)
