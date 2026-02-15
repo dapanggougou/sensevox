@@ -2,7 +2,7 @@
 
 [[English](README_EN.md)] [[粵語](README_YUE.md)] [[日本語](README_JP.md)] [[한국어](README_KO.md)]
 
-<img src="https://github.com/user-attachments/assets/84f46047-d144-4cc3-976b-24670f66e463" alt="示例图片" width="250"/>
+<img src="https://github.com/user-attachments/assets/84f46047-d144-4cc3-976b-24670f66e463" alt="示例图片" width="250"/><img src="https://raw.githubusercontent.com/dapanggougou/sensevox/main/wxpython/images/screenshot_0.2.0.jpg" width="250" alt="新界面">
 
 ## 特性
 
