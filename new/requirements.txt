@@ -1,0 +1,8 @@
+wxPython
+pyperclip
+miniaudio
+keyboard
+sherpa-onnx
+numpy
+opencc
+pyinstaller
