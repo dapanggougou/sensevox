@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-import wx
 import ctypes
+import datetime
+import os
+import re
+import sys
 import threading
 import time
-import os
-import sys
-import datetime
-import re
 import traceback
-import wave
-import pyperclip
 from collections import deque
+from ctypes import wintypes
+
+import wx
 
 # --- 依赖库安全导入 ---
 try:
@@ -39,94 +39,116 @@ except ImportError:
 
 import numpy as np
 
+
 # --- DPI 适配 ---
-try:
-    ctypes.windll.shcore.SetProcessDpiAwarenessContext(-4)
-except (AttributeError, OSError):
+def _enable_dpi_awareness():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwarenessContext(-4)
+        return
+    except (AttributeError, OSError):
+        pass
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
     except (AttributeError, OSError):
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except (AttributeError, OSError):
-            pass
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
+_enable_dpi_awareness()
+
+
+# ------------------------------------------------------------------
+# 路径工具：不写死任何绝对路径，全部相对脚本 / 配置文件
+# ------------------------------------------------------------------
+def get_app_dir():
+    """程序所在目录（兼容 PyInstaller 打包）。作为默认保底模型目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def get_asset_path(relative_path):
-    """获取 assets 目录下文件的完整路径（兼容打包环境）"""
+    """assets 目录下文件的完整路径（与 v0.6 一致，兼容打包环境）"""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         base_path = sys._MEIPASS
     else:
-        try:
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        except NameError:
-            base_path = os.path.abspath(".")
+        base_path = get_app_dir()
     return os.path.join(base_path, "assets", relative_path)
+
+
+def load_app_icon():
+    """加载窗口图标，优先使用 assets/app_icon.ico，否则回退到 exe 自身内嵌图标。
+
+    PyInstaller 的 -i/--icon 只写入 exe 的图标资源，不会附带 .ico 文件。
+    这里用 wx.IconLocation 指定 exe 内的图标索引：wxWidgets 在 Windows 下
+    对 ICO 的处理会调用 Win32 ExtractIconEx/ExtractIcon，而它们同样能读取
+    .exe 的图标资源，因此无需再单独分发 app_icon.ico。
+    """
+    if os.path.exists(ICON_PATH):
+        try:
+            icon = wx.Icon(ICON_PATH, wx.BITMAP_TYPE_ICO)
+            if icon.IsOk():
+                return icon
+        except Exception:
+            pass
+
+    if getattr(sys, "frozen", False):
+        try:
+            executable = sys.executable
+            # 先尝试大图标(索引 0)，失败再取小图标(索引 1)
+            for index in (0, 1):
+                icon = wx.Icon(wx.IconLocation(executable, index))
+                if icon.IsOk():
+                    return icon
+        except Exception:
+            pass
+
+    return None
 
 
 # --- 核心常量配置 ---
 CHUNK = 1024 * 2
 CHANNELS = 1
 RATE = 16000
-SAMPLE_WIDTH_BYTES = 2
 MIN_RECORD_SECONDS = 0.3
 MAX_RECORD_SECONDS = 30.0          # 最长录音时间
 IDLE_POLL_SLEEP = 0.02            # 空闲轮询间隔（防止 CPU 飙高）
-DEFAULT_HOTKEY = "space"
-MAX_FILENAME_TEXT_LEN = 15
+DEFAULT_HOTKEY = "caps lock"
 
 # 标点符号集合（用于去除少量标点）
 ALL_PUNCTUATION = """!"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~，。、！？：；（）【】「」『』“”‘’·～《》〈〉﹏——……〜・〝〟‹›"""
+
+# SenseVoice 富文本模型会输出 "词。" + \ue000 + "N" 形式（N 为停顿等级）。
+# 该控制字符不能直接注入键盘，需在输出前剥离。
+_PAUSE_MARKER = "\ue000"
+_RE_PAUSE_MARKER = re.compile("\ue000[0-9]*")
 
 # 预计算常量，提升运行时性能
 _PUNCTUATION_SET = frozenset(ALL_PUNCTUATION)
 _TRANSLATE_TABLE = str.maketrans("", "", ALL_PUNCTUATION)
 _TAIL_PADDING = np.zeros(int(0.5 * RATE), dtype=np.float32)
-_RE_INVALID_CHARS = re.compile(r'[\\/*?:"<>|\n\r\t]+')
-_RE_WHITESPACE = re.compile(r"\s+")
 _INT16_SCALE = np.float32(1.0 / 32768.0)
-_FLOAT32_SCALE = np.float32(32767.0)
 _MAX_LOG_LINES = 100
+_MAX_MONITOR_CHUNKS = 16          # 监听播放队列上限，超出则丢最旧块以限制延迟累积
 
-# --- 路径与文件 ---
-MODEL_DIR = get_asset_path("sensevoicesmallonnx")
-MODEL_FILE_PATH = os.path.join(MODEL_DIR, "model.onnx")
-TOKENS_FILE_PATH = os.path.join(MODEL_DIR, "tokens.txt")
-GTCRN_MODEL_PATH = get_asset_path("gtcrn_simple.onnx")
-ICON_PATH = get_asset_path("app_icon.ico")
-
-QWEN3_ASR_DIR = get_asset_path("qwen3-asr")
-QWEN3_ASR_FILES = {
-    "conv_frontend": os.path.join(QWEN3_ASR_DIR, "conv_frontend.onnx"),
-    "encoder": os.path.join(QWEN3_ASR_DIR, "encoder.int8.onnx"),
-    "decoder": os.path.join(QWEN3_ASR_DIR, "decoder.int8.onnx"),
-    "tokenizer": os.path.join(QWEN3_ASR_DIR, "tokenizer"),
-}
-
+# --- 路径与文件（模型目录运行时决定，其余配置与 v0.6 一致放 assets） ---
+MODEL_DIR_CONFIG_PATH = get_asset_path("model_dir.txt")
 HOTKEY_FILE_PATH = get_asset_path("hotkey.txt")
-GTCRN_CONFIG_PATH = get_asset_path("gtcrn_config.txt")
-SAVE_RECORDING_CONFIG_PATH = get_asset_path("save_recording_config.txt")
+MONITOR_CONFIG_PATH = get_asset_path("monitor_config.txt")
 OPENCC_CONFIG_PATH = get_asset_path("opencc_config.txt")
 OPENCC_ENABLED_PATH = get_asset_path("opencc_enabled.txt")
-ENGINE_CONFIG_PATH = get_asset_path("engine_config.txt")
+ICON_PATH = get_asset_path("app_icon.ico")
 
-# --- 语音识别引擎 ---
-ENGINE_SENSEVOICE = "sensevoice"
-ENGINE_QWEN3_ASR = "qwen3-asr"
-ENGINE_OPTIONS = [ENGINE_SENSEVOICE, ENGINE_QWEN3_ASR]
+# 模型目录中必须存在的文件
+MODEL_ONNX_NAME = "model.onnx"
+TOKENS_NAME = "tokens.txt"
 
-ENGINE_LANGUAGES = {
-    ENGINE_SENSEVOICE: ["auto", "zh", "en", "ja", "ko", "yue"],
-    ENGINE_QWEN3_ASR: [
-        "auto", "Chinese", "English", "Japanese", "Korean", "Cantonese",
-        "Arabic", "German", "French", "Spanish", "Portuguese", "Indonesian",
-        "Italian", "Russian", "Thai", "Vietnamese", "Turkish", "Hindi",
-        "Malay", "Dutch", "Swedish", "Danish", "Finnish", "Polish", "Czech",
-        "Filipino", "Persian", "Greek", "Hungarian", "Macedonian", "Romanian",
-    ],
-}
-
-DEFAULT_ENGINE_LANGUAGE = "auto"
+DEFAULT_LANGUAGE = "auto"
+LANGUAGES = ["auto", "zh", "en", "ja", "ko", "yue"]
 
 OPENCC_OPTIONS = [
     "s2t.json 簡 → 繁", "t2s.json 繁 → 簡", "s2tw.json 簡 → 臺灣繁",
@@ -137,19 +159,105 @@ OPENCC_OPTIONS = [
 ]
 
 
+# ==================================================================
+# SendInput 文本注入（Windows 原生，性能最佳）
+# ==================================================================
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    # 必须包含全部三个成员：SendInput 会校验 cbSize，而 union 的大小由最大的
+    # 成员 MOUSEINPUT 决定（x64 下使 INPUT 为 56 字节）。只声明 ki 会得到 40，
+    # 调用即返回 ERROR_INVALID_PARAMETER (87)。
+    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+
+user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+user32.SendInput.restype = wintypes.UINT
+
+_INPUT_SIZE = ctypes.sizeof(INPUT)
+
+
+def _send_inputs(events):
+    """一次性把事件数组送入系统输入流（原子操作，不会被用户输入插入）"""
+    count = len(events)
+    if count == 0:
+        return
+    arr = (INPUT * count)(*events)
+    sent = user32.SendInput(count, arr, _INPUT_SIZE)
+    if sent != count:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _unicode_events(text):
+    """把字符串编成 KEYEVENTF_UNICODE 按下/抬起事件（UTF-16，含 surrogate pair）"""
+    units = text.encode("utf-16-le")
+    events = []
+    for i in range(0, len(units), 2):
+        code = units[i] | (units[i + 1] << 8)
+        events.append(INPUT(INPUT_KEYBOARD, _INPUTUNION(
+            ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, None))))
+        events.append(INPUT(INPUT_KEYBOARD, _INPUTUNION(
+            ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, None))))
+    return events
+
+
+def send_unicode_text(text):
+    """把整个字符串一次性送进系统输入流（含 Unicode / emoji）"""
+    _send_inputs(_unicode_events(text))
+
+
+# ==================================================================
+# 音频设备
+# ==================================================================
 class AudioDeviceError(Exception):
     """音频设备异常"""
 
 
 class PyMiniaudioRecorder:
-    """基于 miniaudio 的录音类（由 v2 优化，保留 v1 的稳定性）"""
+    """基于 miniaudio 的录音类；可选把每个数据块同步给监听播放器"""
 
-    def __init__(self, device_index=-1, frame_length=CHUNK, stall_timeout=1.0, max_queue_chunks=128):
-        self.device_index = device_index
+    def __init__(self, frame_length=CHUNK, stall_timeout=1.0, max_queue_chunks=128):
         self.frame_length = frame_length
         self.sample_rate = RATE
         self.channels = CHANNELS
-        self.sample_width = SAMPLE_WIDTH_BYTES
         self.dev = None
         self.buffer = bytearray()
         self.queue = deque()
@@ -161,10 +269,15 @@ class PyMiniaudioRecorder:
         self.last_data_time = 0.0
         self.stall_timeout = stall_timeout
         self.max_queue_chunks = max_queue_chunks
-        self._chunk_bytes = self.frame_length * self.channels * self.sample_width
+        self._chunk_bytes = self.frame_length * self.channels * 2
+        self._monitor_sink = None      # 监听播放器 push 回调（在音频线程中调用）
+
+    def set_monitor_sink(self, sink):
+        """设置监听播放回调（None 表示关闭）。回调必须极快且不抛异常。"""
+        self._monitor_sink = sink
 
     def _capture_generator(self):
-        """miniaudio 数据回调生成器（v2 优化版：局部变量减少属性访问）"""
+        """miniaudio 数据回调生成器（局部变量减少属性访问）"""
         _ = yield
         chunk_bytes = self._chunk_bytes
         buf = self.buffer
@@ -177,12 +290,20 @@ class PyMiniaudioRecorder:
             data = yield
             if not data:
                 continue
+            chunk = bytes(data)
+            # 同步送给监听播放器（送入识别前的原始音频）
+            sink = self._monitor_sink
+            if sink is not None:
+                try:
+                    sink(chunk)
+                except Exception:
+                    pass
             with cond:
-                buf.extend(data)
+                buf.extend(chunk)
                 while len(buf) >= chunk_bytes:
-                    chunk = bytes(buf[:chunk_bytes])
+                    piece = bytes(buf[:chunk_bytes])
                     del buf[:chunk_bytes]
-                    q.append(chunk)
+                    q.append(piece)
                     if len(q) > max_q:
                         q.popleft()
                 self.received_data = True
@@ -225,6 +346,7 @@ class PyMiniaudioRecorder:
             self.running = False
             self.cond.notify_all()
         self._gen = None
+        self._monitor_sink = None
 
     def wait_ready(self, timeout=1.0):
         """等待设备就绪"""
@@ -249,17 +371,110 @@ class PyMiniaudioRecorder:
                 if not self.received_data and waited >= self.stall_timeout:
                     raise AudioDeviceError("未收到任何音频数据")
             if len(self.queue) == 0:
-                # 极速生成全 0 bytes，避免创建 np 数组再转字节的开销
+                # 补静音，避免下游出现空块
                 return bytes(self._chunk_bytes)
             return self.queue.popleft()
 
 
+class MonitorSpeaker:
+    """监听播放器：把录音数据块实时输出到默认扬声器。
+
+    采样率对齐由 miniaudio 内部重采样处理（16000 -> 设备采样率）。
+    """
+
+    def __init__(self, frame_length=CHUNK):
+        self.frame_length = frame_length
+        self.queue = deque()
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.running = False
+        self.dev = None
+        self._gen = None
+        self.underruns = 0
+        self.overruns = 0
+
+    def _playback_generator(self):
+        """miniaudio 播放回调生成器（必须已在 start 前 next() 一次）
+
+        回调要求恰好 required_frames 帧（frames * channels * 2 字节）。
+        少给会被静音补齐，多给会抛 MiniaudioError，故此处严格对齐字节数。
+        """
+        required_frames = yield b""
+        frame_length = self.frame_length
+        chunk_bytes = frame_length * CHANNELS * 2
+        q = self.queue
+        cond = self.cond
+        while True:
+            need_bytes = (required_frames or frame_length) * CHANNELS * 2
+            out = bytearray()
+            with cond:
+                # 以整块取出，取出后按需截断以满足精确字节数
+                while self.running and len(out) < need_bytes:
+                    if q:
+                        out.extend(q.popleft())
+                    else:
+                        self.underruns += 1
+                        break
+            if len(out) < need_bytes:
+                out.extend(bytes(need_bytes - len(out)))
+            elif len(out) > need_bytes:
+                extra = out[need_bytes:]
+                out = out[:need_bytes]
+                with cond:
+                    self.queue.appendleft(bytes(extra))   # 余量放回队首
+            required_frames = yield bytes(out)
+
+    def push(self, chunk):
+        """由录音线程调用：压入待播放数据（极快，不阻塞）"""
+        with self.cond:
+            q = self.queue
+            q.append(chunk)
+            if len(q) > _MAX_MONITOR_CHUNKS:
+                q.popleft()
+                self.overruns += 1
+
+    def start(self):
+        if self.running:
+            return
+        self.queue = deque()
+        self.running = True
+        self.dev = miniaudio.PlaybackDevice(
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=CHANNELS,
+            sample_rate=RATE,
+            buffersize_msec=60,
+        )
+        self._gen = self._playback_generator()
+        next(self._gen)
+        self.dev.start(self._gen)
+
+    def stop(self):
+        with self.cond:
+            self.running = False
+            self.cond.notify_all()
+        if self.dev:
+            try:
+                self.dev.stop()
+            except Exception:
+                pass
+            try:
+                self.dev.close()
+            except Exception:
+                pass
+            self.dev = None
+        self._gen = None
+        self.queue = deque()
+
+
+# ==================================================================
+# 主窗口
+# ==================================================================
 class MyFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="神色语音sensevox", size=(500, 560))
+        super().__init__(None, title="神色语音sensevox", size=(480, 540))
         self.recorder = None
+        self.speaker = None
         self.model = None
-        self.gtcrn_denoiser = None
         self.opencc_converter = None
         self.listening_event = threading.Event()
         self.capturing_hotkey_event = threading.Event()
@@ -267,95 +482,102 @@ class MyFrame(wx.Frame):
         self.capture_thread = None
         self.was_listening_before_suspend = False
         self._log_line_count = 0
-        self._save_threads = []          # 后台保存音频的线程列表，用于退出时等待
 
         # 启动监听时锁定的一组配置状态，供后台线程安全访问
-        self._save_recording_enabled = False
-        self._enhance_enabled = False
+        self._monitor_enabled = False
         self._opencc_enabled = False
-        self._engine_name = ENGINE_SENSEVOICE
-        self._engine_language = DEFAULT_ENGINE_LANGUAGE
+        self._language = DEFAULT_LANGUAGE
 
-        if os.path.exists(ICON_PATH):
-            self.SetIcon(wx.Icon(ICON_PATH, wx.BITMAP_TYPE_ICO))
+        icon = load_app_icon()
+        if icon is not None:
+            self.SetIcon(icon)
 
         # 加载配置
         self.current_hotkey = self.load_setting(HOTKEY_FILE_PATH, DEFAULT_HOTKEY)
-        initial_gtcrn_state = self.load_setting(GTCRN_CONFIG_PATH, "true").lower() == "true"
-        initial_save_state = self.load_setting(SAVE_RECORDING_CONFIG_PATH, "true").lower() == "true"
+        self.current_model_dir = self.load_setting(MODEL_DIR_CONFIG_PATH, "").strip() or get_app_dir()
+        initial_monitor_state = self.load_setting(MONITOR_CONFIG_PATH, "false").lower() == "true"
         initial_opencc_state = self.load_setting(OPENCC_ENABLED_PATH, "false").lower() == "true"
         initial_opencc_config = self.load_setting(OPENCC_CONFIG_PATH, OPENCC_OPTIONS[0])
-
-        saved_engine = self.load_setting(ENGINE_CONFIG_PATH, ENGINE_SENSEVOICE)
-        self.current_engine = saved_engine if saved_engine in ENGINE_OPTIONS else ENGINE_SENSEVOICE
-        self.engine_languages = {
-            engine: DEFAULT_ENGINE_LANGUAGE for engine in ENGINE_OPTIONS
-        }
-        self.current_language = DEFAULT_ENGINE_LANGUAGE
-
         # 构建 UI
-        self._init_ui(initial_gtcrn_state, initial_save_state,
-                      initial_opencc_state, initial_opencc_config)
+        self._init_ui(initial_monitor_state, initial_opencc_state, initial_opencc_config)
         self.BindEvents()
-        self.SetMinSize((450, 560))
+        self.SetMinSize((440, 500))
         self.Centre()
         self.run_initial_checks()
         self.update_ui_state()
 
-    def _init_ui(self, initial_gtcrn_state, initial_save_state,
-                 initial_opencc_state, initial_opencc_config):
-        """创建界面（v2 结构，保留 v1 的全部控件）"""
+    # ------------------------------------------------------------
+    # 模型路径
+    # ------------------------------------------------------------
+    def model_onnx_path(self):
+        return os.path.join(self.current_model_dir, MODEL_ONNX_NAME)
+
+    def tokens_path(self):
+        return os.path.join(self.current_model_dir, TOKENS_NAME)
+
+    def missing_model_files(self):
+        return [p for p in (self.model_onnx_path(), self.tokens_path()) if not os.path.exists(p)]
+
+    def _model_dir_tooltip(self):
+        """模型目录按钮/标签的悬浮提示（含当前持久化目录）"""
+        return (
+            "模型目录：该目录内需包含 model.onnx 与 tokens.txt。\n"
+            "本程序使用模型：sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17\n\n"
+            "当前持久化目录：\n" + self.current_model_dir
+        )
+
+    # ------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------
+    def _init_ui(self, initial_monitor_state, initial_opencc_state, initial_opencc_config):
         panel = wx.Panel(self)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # 第一行按钮：启动 / 暂停 / 设置热键
         grid_sizer = wx.FlexGridSizer(rows=1, cols=3, hgap=8, vgap=8)
-        grid_sizer.AddGrowableCol(0, 1)
-        grid_sizer.AddGrowableCol(1, 1)
-        grid_sizer.AddGrowableCol(2, 1)
+        for col in range(3):
+            grid_sizer.AddGrowableCol(col, 1)
 
         self.btn_start = wx.Button(panel, label="Start 启动")
         self.btn_stop = wx.Button(panel, label="Stop 暂停")
         self.btn_hotkey = wx.Button(panel, label=f"Hotkey: {self.current_hotkey}")
-        for btn in [self.btn_start, self.btn_stop, self.btn_hotkey]:
+        for btn in (self.btn_start, self.btn_stop, self.btn_hotkey):
             btn.SetMinSize((-1, 34))
         grid_sizer.Add(self.btn_start, 0, wx.EXPAND | wx.ALL, 2)
         grid_sizer.Add(self.btn_stop, 0, wx.EXPAND | wx.ALL, 2)
         grid_sizer.Add(self.btn_hotkey, 0, wx.EXPAND | wx.ALL, 2)
         main_sizer.Add(grid_sizer, 0, wx.ALL | wx.EXPAND, 10)
 
-        # 语音识别引擎选择
-        engine_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.engine_label = wx.StaticText(panel, label="语音识别引擎 ASR Engine：")
-        self.combo_engine = wx.ComboBox(
-            panel, value=self.current_engine,
-            choices=ENGINE_OPTIONS, style=wx.CB_READONLY
-        )
-        engine_sizer.Add(self.engine_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
-        engine_sizer.Add(self.combo_engine, 1, wx.EXPAND)
-        main_sizer.Add(engine_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
+        # 模型目录选择：标签 + 按钮同一行，详细说明放气泡提示
+        self.lbl_model_dir = wx.StaticText(panel, label="模型目录 Model Dir：")
+        self.lbl_model_dir.SetToolTip(self._model_dir_tooltip())
+        self.btn_model_dir = wx.Button(panel, label="选择模型目录...")
+        self.btn_model_dir.SetMinSize((140, 30))
+        self.btn_model_dir.SetToolTip(self._model_dir_tooltip())
+        model_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        model_sizer.Add(self.lbl_model_dir, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        model_sizer.Add(self.btn_model_dir, 1, wx.EXPAND)
+        main_sizer.Add(model_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
 
         # 语言选择
+        lang_tip = "这个选项几乎没用，无论选择什么都会和 auto 自动的效果一致，请随意选择吧"
         lang_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.lang_label = wx.StaticText(panel, label="语言 Language：")
-        self.combo_box = wx.ComboBox(
-            panel, value=self.current_language,
-            choices=ENGINE_LANGUAGES[self.current_engine],
-            style=wx.CB_READONLY
-        )
+        self.lang_label.SetToolTip(lang_tip)
+        self.combo_box = wx.ComboBox(panel, value=DEFAULT_LANGUAGE,
+                                     choices=LANGUAGES, style=wx.CB_READONLY)
+        self.combo_box.SetToolTip(lang_tip)
         lang_sizer.Add(self.lang_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
         lang_sizer.Add(self.combo_box, 1, wx.EXPAND)
         main_sizer.Add(lang_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
 
-        # GTCRN 增强复选框
-        self.chk_gtcrn_enhance = wx.CheckBox(panel, label="GTCRN 增强 (需要 assets/gtcrn_simple.onnx)")
-        self.chk_gtcrn_enhance.SetValue(initial_gtcrn_state)
-        main_sizer.Add(self.chk_gtcrn_enhance, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
-
-        # 保存录音复选框
-        self.chk_save_recording = wx.CheckBox(panel, label="保存录音 (保存在 '录音' 文件夹)")
-        self.chk_save_recording.SetValue(initial_save_state)
-        main_sizer.Add(self.chk_save_recording, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
+        # 监听复选框（替代原保存录音）
+        self.chk_monitor = wx.CheckBox(panel, label="监听 Monitor")
+        self.chk_monitor.SetValue(initial_monitor_state)
+        self.chk_monitor.SetToolTip(
+            "实时输出到扬声器，内容为送入识别前的原始音频。\n"
+            "注意：外放时会形成回环自激（啸叫），请佩戴耳机。")
+        main_sizer.Add(self.chk_monitor, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
 
         # OpenCC 设置行
         opencc_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -378,7 +600,7 @@ class MyFrame(wx.Frame):
         bottom_grid.AddGrowableCol(1, 1)
         self.btn_clear_log = wx.Button(panel, label="Clear 清除日志")
         self.btn_copy_log = wx.Button(panel, label="Copy 复制日志")
-        for btn in [self.btn_clear_log, self.btn_copy_log]:
+        for btn in (self.btn_clear_log, self.btn_copy_log):
             btn.SetMinSize((-1, 34))
         bottom_grid.Add(self.btn_clear_log, 0, wx.EXPAND | wx.ALL, 2)
         bottom_grid.Add(self.btn_copy_log, 0, wx.EXPAND | wx.ALL, 2)
@@ -387,14 +609,13 @@ class MyFrame(wx.Frame):
         panel.SetSizer(main_sizer)
 
     def BindEvents(self):
-        """绑定事件（v1 全部事件 + v2 的电源管理）"""
         self.btn_start.Bind(wx.EVT_BUTTON, self.on_start_listening)
         self.btn_stop.Bind(wx.EVT_BUTTON, self.on_stop_listening)
         self.btn_hotkey.Bind(wx.EVT_BUTTON, self.on_set_hotkey)
+        self.btn_model_dir.Bind(wx.EVT_BUTTON, self.on_choose_model_dir)
         self.btn_clear_log.Bind(wx.EVT_BUTTON, self.on_clear_log)
         self.btn_copy_log.Bind(wx.EVT_BUTTON, self.on_copy_log)
-        self.combo_box.Bind(wx.EVT_COMBOBOX, self.on_combo_select)
-        self.combo_engine.Bind(wx.EVT_COMBOBOX, self.on_engine_select)
+        self.combo_box.Bind(wx.EVT_COMBOBOX, self.on_language_select)
         self.chk_opencc.Bind(wx.EVT_CHECKBOX, self.on_opencc_toggle)
         self.combo_opencc.Bind(wx.EVT_COMBOBOX, self.on_opencc_select)
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -405,7 +626,7 @@ class MyFrame(wx.Frame):
             self.Bind(wx.EVT_POWER_RESUME, self.on_power_resume)
 
     def log(self, message, level="INFO"):
-        """线程安全日志（v2 高效计数器 + v1 完整格式）"""
+        """线程安全日志"""
         timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         log_entry = f"[{timestamp} {level}] {message}\n"
 
@@ -416,7 +637,7 @@ class MyFrame(wx.Frame):
                 extra = self._log_line_count - _MAX_LOG_LINES
                 end_pos = self.log_text.XYToPosition(0, extra)
                 if end_pos != wx.NOT_FOUND and end_pos > 0:
-                    self.log_text.Freeze()   # 防止闪烁
+                    self.log_text.Freeze()
                     self.log_text.Remove(0, end_pos)
                     self.log_text.Thaw()
                 self._log_line_count = _MAX_LOG_LINES
@@ -432,10 +653,9 @@ class MyFrame(wx.Frame):
         self.btn_start.Enable(not is_running_or_capturing)
         self.btn_stop.Enable(is_listening and not is_capturing_hotkey)
         self.btn_hotkey.Enable(not is_running_or_capturing)
+        self.btn_model_dir.Enable(not is_running_or_capturing)
         self.combo_box.Enable(not is_running_or_capturing)
-        self.combo_engine.Enable(not is_running_or_capturing)
-        self.chk_gtcrn_enhance.Enable(not is_running_or_capturing and os.path.exists(GTCRN_MODEL_PATH))
-        self.chk_save_recording.Enable(not is_running_or_capturing)
+        self.chk_monitor.Enable(not is_running_or_capturing)
         self.chk_opencc.Enable(not is_running_or_capturing and OPENCC_AVAILABLE)
         self.combo_opencc.Enable(not is_running_or_capturing and self.chk_opencc.IsChecked() and OPENCC_AVAILABLE)
 
@@ -445,24 +665,46 @@ class MyFrame(wx.Frame):
             self.btn_hotkey.SetLabel(f"Hotkey: {self.current_hotkey}")
 
     # ------------------------------------------------------------
-    # 音频与识别核心逻辑
+    # 音频资源管理
     # ------------------------------------------------------------
     def _initialize_audio_system(self):
-        """初始化录音设备（v1 详细日志 + v2 简洁启动）"""
+        """初始化录音设备，并按需启动监听播放"""
         self.log("Initializing PyMiniaudio recording device... 初始化 PyMiniaudio 录音设备...", "INFO")
         try:
-            self.recorder = PyMiniaudioRecorder(device_index=-1, frame_length=CHUNK)
+            self.recorder = PyMiniaudioRecorder(frame_length=CHUNK)
             self.recorder.start()
             if not self.recorder.wait_ready(timeout=1.0):
                 raise AudioDeviceError("未检测到音频输入")
-            return True
         except Exception as e:
             self.log(f"Failed to initialize audio device 录音设备初始化失败: {e}", "ERROR")
             self._cleanup_audio_resources()
             return False
 
+        if self._monitor_enabled:
+            try:
+                self.speaker = MonitorSpeaker(frame_length=CHUNK)
+                self.speaker.start()
+                self.recorder.set_monitor_sink(self.speaker.push)
+                self.log("Monitor output started (raw audio -> speaker). 监听已开启（原始音频 → 扬声器）。", "SUCCESS")
+                self.log("Tip: use headphones to avoid feedback howling. 提示：请佩戴耳机，外放会产生回环啸叫。", "WARNING")
+            except Exception as e:
+                self.speaker = None
+                self.recorder.set_monitor_sink(None)
+                self.log(f"Monitor output unavailable 监听输出不可用: {e}", "WARNING")
+
+        return True
+
     def _cleanup_audio_resources(self):
-        """释放录音资源（v1 完整日志）"""
+        """释放录音与监听资源"""
+        if self.recorder:
+            self.recorder.set_monitor_sink(None)
+        if self.speaker:
+            try:
+                self.speaker.stop()
+            except Exception as e:
+                self.log(f"Error stopping monitor 停止监听时出错: {e}", "WARNING")
+            finally:
+                self.speaker = None
         if self.recorder:
             try:
                 self.recorder.stop()
@@ -472,30 +714,30 @@ class MyFrame(wx.Frame):
                 self.recorder = None
         self.log("Audio resources released. 音频资源已释放。", "DEBUG")
 
+    # ------------------------------------------------------------
+    # 启动 / 停止监听
+    # ------------------------------------------------------------
     def on_start_listening(self, event):
-        """启动监听（融合 v1 的健壮检查与 v2 的模型复用）"""
         if not self.run_initial_checks():
-            wx.MessageBox("初始检查未通过，请查看日志。\nInitial checks failed, please see the log.", "错误 Error", wx.OK | wx.ICON_ERROR)
+            wx.MessageBox("初始检查未通过，请查看日志。\nInitial checks failed, please see the log.",
+                          "错误 Error", wx.OK | wx.ICON_ERROR)
             return
         if self.listening_event.is_set():
             self.log("Listening is already running. 监听已在运行中。", "WARNING")
             return
 
+        # 先锁定 UI 状态供后台线程使用（音频初始化需要知道是否开启监听）
+        self._monitor_enabled = self.chk_monitor.IsChecked()
+        self._opencc_enabled = self.chk_opencc.IsChecked()
+        self._language = self.combo_box.GetValue()
+
         if not self._initialize_audio_system():
             self.update_ui_state()
             return
 
-        # 锁定 UI 状态供后台线程使用
-        self._save_recording_enabled = self.chk_save_recording.IsChecked()
-        self._enhance_enabled = self.chk_gtcrn_enhance.IsChecked()
-        self._opencc_enabled = self.chk_opencc.IsChecked()
-        self._engine_name = self.current_engine
-        self._engine_language = self.current_language
-
         # 加载 / 复用语音识别模型
         if self.model is None:
-            engine_display = "Qwen3-ASR" if self._engine_name == ENGINE_QWEN3_ASR else "SenseVoice"
-            self.log(f"Loading Sherpa-ONNX speech recognition model ({engine_display})... 正在加载 {engine_display} 语音识别模型...", "INFO")
+            self.log("Loading Sherpa-ONNX SenseVoice model... 正在加载 SenseVoice 语音识别模型...", "INFO")
             try:
                 self.model = self._create_recognizer()
                 self.log("Speech recognition model loaded successfully. 语音识别模型加载成功。", "SUCCESS")
@@ -508,34 +750,12 @@ class MyFrame(wx.Frame):
         else:
             self.log("Reusing already loaded speech recognition model. 复用已加载的语音识别模型。", "DEBUG")
 
-        # 加载 GTCRN 降噪模型（若启用且已安装模型）
-        if self._enhance_enabled and os.path.exists(GTCRN_MODEL_PATH):
-            if self.gtcrn_denoiser is None:
-                self.log("Loading GTCRN noise reduction model... 正在加载 GTCRN 降噪模型...", "INFO")
-                try:
-                    config = sherpa_onnx.OfflineSpeechDenoiserConfig(
-                        model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
-                            gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(
-                                model=GTCRN_MODEL_PATH
-                            ),
-                            provider="cpu",
-                            num_threads=2,
-                        )
-                    )
-                    self.gtcrn_denoiser = sherpa_onnx.OfflineSpeechDenoiser(config)
-                    self.log("GTCRN noise reduction model loaded successfully. GTCRN 降噪模型加载成功。", "SUCCESS")
-                except Exception as e:
-                    self.log(f"Failed to load GTCRN model GTCRN 模型加载失败: {e}", "ERROR")
-                    self.gtcrn_denoiser = None
-        else:
-            self.gtcrn_denoiser = None
-
         # 初始化 OpenCC 转换器
         if self._opencc_enabled and OPENCC_AVAILABLE:
             try:
                 selected_config = self.combo_opencc.GetValue().split()[0]
                 self.opencc_converter = opencc.OpenCC(selected_config)
-                self.log(f"OpenCC converter initialized (config: {selected_config}). OpenCC 转换器已初始化 (配置: {selected_config})", "INFO")
+                self.log(f"OpenCC converter initialized (config: {selected_config}). OpenCC 转换器已初始化。", "INFO")
             except Exception as e:
                 self.log(f"Failed to initialize OpenCC OpenCC 初始化失败: {e}", "ERROR")
                 self.opencc_converter = None
@@ -549,7 +769,6 @@ class MyFrame(wx.Frame):
         self.update_ui_state()
 
     def on_stop_listening(self, event):
-        """停止监听（v1 释放 GTCRN/OpenCC 以节省内存）"""
         if not self.listening_event.is_set():
             return
         self.log("Stopping listening... 正在停止监听...", "INFO")
@@ -557,52 +776,23 @@ class MyFrame(wx.Frame):
         if self.listener_thread and self.listener_thread.is_alive():
             self.listener_thread.join(timeout=2.0)
         self._cleanup_audio_resources()
-
-        # 释放辅助模型，主模型保留以便快速重启
-        self.gtcrn_denoiser = None
         self.opencc_converter = None
-
         self.log("Listening stopped, resources released. 监听已停止，资源已释放。", "INFO")
         self.update_ui_state()
 
     def _create_recognizer(self):
-        """根据当前引擎创建对应的 Sherpa-ONNX 离线识别器"""
-        if self._engine_name == ENGINE_QWEN3_ASR:
-            return sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
-                conv_frontend=QWEN3_ASR_FILES["conv_frontend"],
-                encoder=QWEN3_ASR_FILES["encoder"],
-                decoder=QWEN3_ASR_FILES["decoder"],
-                tokenizer=QWEN3_ASR_FILES["tokenizer"],
-                max_new_tokens=256,
-                num_threads=2,
-                provider="cpu",
-            )
+        """创建 SenseVoice 离线识别器"""
         return sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=MODEL_FILE_PATH,
-            tokens=TOKENS_FILE_PATH,
-            language=self._engine_language if self._engine_language != "auto" else "",
+            model=self.model_onnx_path(),
+            tokens=self.tokens_path(),
+            language=self._language if self._language != "auto" else "",
             use_itn=True,
             num_threads=2,
             provider="cpu",
         )
 
-    def _missing_engine_files(self, engine):
-        """返回指定引擎缺失的模型文件列表；全部存在时返回空列表"""
-        if engine == ENGINE_SENSEVOICE:
-            required = [MODEL_FILE_PATH, TOKENS_FILE_PATH]
-        elif engine == ENGINE_QWEN3_ASR:
-            required = [QWEN3_ASR_DIR] + [
-                os.path.join(QWEN3_ASR_DIR, "conv_frontend.onnx"),
-                os.path.join(QWEN3_ASR_DIR, "encoder.int8.onnx"),
-                os.path.join(QWEN3_ASR_DIR, "decoder.int8.onnx"),
-                os.path.join(QWEN3_ASR_DIR, "tokenizer"),
-            ]
-        else:
-            required = []
-        return [f for f in required if not os.path.exists(f)]
-
     def listen_loop(self):
-        """主监听循环（融合 v1 的详细错误处理与 v2 的简洁逻辑）"""
+        """主监听循环（含音频设备自动重连）"""
         MAX_RETRIES = 5
         RETRY_DELAY = 2.0
 
@@ -641,7 +831,7 @@ class MyFrame(wx.Frame):
         self.log("Listening thread finished. 监听线程已结束。", "DEBUG")
 
     def perform_record_and_transcribe(self):
-        """执行一次完整的“录音→识别→输出→可选保存”流程"""
+        """执行一次完整的「录音 → 识别 → 输出」流程"""
         blocked_keys = []
         hotkey_parts = [part.strip() for part in self.current_hotkey.split("+")]
         is_caps_lock_hotkey = self.current_hotkey.lower() == "caps lock"
@@ -650,13 +840,12 @@ class MyFrame(wx.Frame):
             raw_audio_bytes, duration = self.record_audio(hotkey_parts, blocked_keys)
 
             if raw_audio_bytes and self.listening_event.is_set():
-                ok, transcription_result, bytes_to_save = self.transcribe_local(raw_audio_bytes)
+                ok, transcription_result = self.transcribe_local(raw_audio_bytes)
                 self._unblock_keys(blocked_keys)
 
                 if ok and transcription_result:
                     processed_text = self.process_text(transcription_result)
 
-                    # OpenCC 繁简转换
                     if self._opencc_enabled and OPENCC_AVAILABLE and self.opencc_converter:
                         try:
                             processed_text = self.opencc_converter.convert(processed_text)
@@ -664,19 +853,13 @@ class MyFrame(wx.Frame):
                         except Exception as e:
                             self.log(f"OpenCC conversion failed OpenCC 转换失败: {e}", "ERROR")
 
-                    # 输出到光标位置
                     self.type_text(processed_text)
 
-                    # 处理 Caps Lock 热键（模拟开关）
                     if is_caps_lock_hotkey:
                         try:
                             keyboard.press_and_release("caps lock")
                         except Exception as e:
                             self.log(f"Failed to simulate Caps Lock 模拟 Caps Lock 失败: {e}", "WARNING")
-
-                # 异步保存录音（不阻塞下一次录音）
-                if self._save_recording_enabled and bytes_to_save:
-                    self._spawn_save_worker(bytes_to_save, transcription_result)
 
         except AudioDeviceError:
             raise
@@ -688,14 +871,14 @@ class MyFrame(wx.Frame):
             self._unblock_keys(blocked_keys)
 
     def record_audio(self, hotkey_parts, blocked_keys_list):
-        """录音（核心高性能版本，来自 v2）"""
+        """录音：热键按下开始，松开结束"""
         frames = []
         recording_started = False
         start_time = 0.0
         hotkey = self.current_hotkey
         is_caps_lock_hotkey = hotkey.lower() == "caps lock"
 
-        listening_event_is_set = self.listening_event.is_set   # 局部引用加速
+        listening_event_is_set = self.listening_event.is_set
         monotonic = time.monotonic
         recorder_read = None
 
@@ -762,37 +945,15 @@ class MyFrame(wx.Frame):
         return b"".join(frames), duration
 
     def transcribe_local(self, raw_audio_bytes):
-        """本地语音识别（融合 v1 的稳健返回和 v2 的高性能转换）"""
-        # 原始 int16 bytes 直接用于返回（如果不需要增强，则保存原始音频）
+        """本地语音识别（送入识别的音频即监听输出的音频）"""
         if not self.model or not SHERPA_AVAILABLE:
-            return False, None, raw_audio_bytes
+            return False, None
 
-        # int16 bytes -> float32 numpy，使用乘法极速转换
-        audio_np_float32 = np.frombuffer(raw_audio_bytes, dtype=np.int16).astype(np.float32) * _INT16_SCALE
-        audio_for_transcription = audio_np_float32
-        bytes_to_save = raw_audio_bytes   # 默认保存原声，零转换成本
+        audio_for_transcription = (
+            np.frombuffer(raw_audio_bytes, dtype=np.int16).astype(np.float32) * _INT16_SCALE
+        )
 
-        use_gtcrn = self._enhance_enabled and self.gtcrn_denoiser is not None
-        if use_gtcrn:
-            try:
-                self.log("Applying GTCRN enhancement... 应用 GTCRN 增强...", "DEBUG")
-                enhanced_audio = self.gtcrn_denoiser(audio_np_float32, RATE)
-                audio_for_transcription = np.asarray(enhanced_audio.samples, dtype=np.float32)
-
-                # 只有需要保存录音时，才将 float32 转换回 int16 bytes
-                if self._save_recording_enabled:
-                    bytes_to_save = (audio_for_transcription * _FLOAT32_SCALE).clip(
-                        -32768, 32767
-                    ).astype(np.int16).tobytes()
-            except Exception as e:
-                self.log(f"GTCRN enhancement failed, using original audio GTCRN 增强失败，使用原始音频: {e}", "ERROR")
-
-        # 使用离线流进行识别
         stream = self.model.create_stream()
-        if self._engine_name == ENGINE_QWEN3_ASR:
-            qwen3_language = self._engine_language if self._engine_language != "auto" else ""
-            if qwen3_language:
-                stream.set_option("language", qwen3_language)
         start_time = time.perf_counter()
         try:
             stream.accept_waveform(sample_rate=RATE, waveform=audio_for_transcription)
@@ -801,57 +962,18 @@ class MyFrame(wx.Frame):
             transcribed_text = stream.result.text
         except Exception as e:
             self.log(f"Speech recognition exception 语音识别异常: {e}", "ERROR")
-            return False, None, bytes_to_save
+            return False, None
         finally:
             del stream   # 显式释放 C++ 流，防止内存泄漏
 
         duration = time.perf_counter() - start_time
         self.log(f"Transcription completed 识别完成 ({duration:.2f}s): '{transcribed_text}'", "INFO")
-
-        return True, transcribed_text, bytes_to_save
-
-    def _spawn_save_worker(self, audio_bytes, transcription):
-        """启动后台保存线程（v2 异步优点 + v1 线程跟踪安全退出）"""
-        # 在子线程创建工作前先计算增强标签，避免访问 wx 控件
-        use_enhance = self._enhance_enabled
-        worker = threading.Thread(
-            target=self._save_audio_worker,
-            args=(audio_bytes, transcription, use_enhance),
-            daemon=True
-        )
-        self._save_threads.append(worker)
-        worker.start()
-
-    def _save_audio_worker(self, audio_bytes, transcription, use_enhance):
-        """后台保存音频（完全独立，不阻塞录音）"""
-        if not audio_bytes:
-            return
-        try:
-            recordings_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "录音")
-            os.makedirs(recordings_dir, exist_ok=True)
-
-            # 带微秒的时间戳，避免快速连按时文件重名
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            sanitized_text = self.sanitize_filename_part(transcription)
-            enh_tag = "_enhanced" if use_enhance else ""
-            filename = f"rec_{timestamp}{enh_tag}_{sanitized_text}.wav" if sanitized_text else f"rec_{timestamp}{enh_tag}.wav"
-            filepath = os.path.join(recordings_dir, filename)
-
-            with wave.open(filepath, "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(SAMPLE_WIDTH_BYTES)
-                wf.setframerate(RATE)
-                wf.writeframes(audio_bytes)
-            self.log(f"Recording saved 录音已保存: {os.path.basename(filepath)}", "INFO")
-        except Exception as e:
-            self.log(f"Failed to save recording 保存录音失败: {e}", "ERROR")
-            traceback.print_exc()
+        return True, transcribed_text
 
     # ------------------------------------------------------------
     # 初始检查与配置
     # ------------------------------------------------------------
     def run_initial_checks(self):
-        """初始依赖检查（v1 完整日志）"""
         self.log("Running initial checks... 正在执行初始检查...", "INFO")
         all_ok = True
 
@@ -864,25 +986,16 @@ class MyFrame(wx.Frame):
         if not KEYBOARD_AVAILABLE:
             self.log("keyboard library not installed or permission denied. 未安装 keyboard 库或无权限。", "ERROR")
             all_ok = False
-        # 当前 ASR 引擎的模型文件检查
-        missing_engine_files = self._missing_engine_files(self.current_engine)
-        if missing_engine_files:
-            for f in missing_engine_files:
+
+        missing = self.missing_model_files()
+        if missing:
+            for f in missing:
                 self.log(f"Model file not found 模型文件不存在: {f}", "ERROR")
+            self.log(f"Current model dir 当前模型目录: {self.current_model_dir}", "ERROR")
             all_ok = False
         else:
-            self.log("ASR engine model files complete. ASR 引擎模型文件完整。", "INFO")
+            self.log(f"Model files complete 模型文件完整: {self.current_model_dir}", "INFO")
 
-        # GTCRN 可选
-        if not os.path.exists(GTCRN_MODEL_PATH):
-            self.log("GTCRN model not found, enhancement disabled. GTCRN 模型未找到，增强功能已禁用。", "WARNING")
-            self.chk_gtcrn_enhance.SetValue(False)
-            self.chk_gtcrn_enhance.Disable()
-        else:
-            self.log("GTCRN model found, enhancement available. GTCRN 模型已找到，增强功能可用。", "INFO")
-            self.chk_gtcrn_enhance.Enable()
-
-        # OpenCC 可选
         if not OPENCC_AVAILABLE:
             self.log("opencc library not installed, conversion disabled. 未安装 opencc 库，简繁转换功能已禁用。", "WARNING")
             self.chk_opencc.SetValue(False)
@@ -903,29 +1016,68 @@ class MyFrame(wx.Frame):
     # ------------------------------------------------------------
     # 事件处理
     # ------------------------------------------------------------
+    def on_choose_model_dir(self, event):
+        """选择模型文件并持久化其所在目录。
+
+        用 FileDialog 而非 DirDialog：目录选择器看不到文件内容，无法确认
+        目录里是不是真的放了模型；让用户直接点选 model.onnx 更直观。
+        """
+        current_dir = self.current_model_dir if os.path.isdir(self.current_model_dir) else get_app_dir()
+        with wx.FileDialog(
+            self,
+            "选择模型文件 model.onnx（同目录需有 tokens.txt）",
+            defaultDir=current_dir,
+            defaultFile=MODEL_ONNX_NAME,
+            wildcard="ONNX 模型 (*.onnx)|*.onnx|所有文件 (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        ) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            chosen_file = dlg.GetPath()
+
+        chosen = os.path.dirname(chosen_file)
+        if os.path.basename(chosen_file).lower() != MODEL_ONNX_NAME:
+            wx.MessageBox(
+                "请选择名为 " + MODEL_ONNX_NAME + " 的文件。",
+                "文件不符", wx.OK | wx.ICON_ERROR,
+            )
+            self.log(f"Model file rejected (unexpected name): {chosen_file}", "ERROR")
+            return
+
+        missing = [n for n in (MODEL_ONNX_NAME, TOKENS_NAME)
+                   if not os.path.exists(os.path.join(chosen, n))]
+        if missing:
+            wx.MessageBox(
+                "所选目录缺少模型文件：\n\n" + "\n".join(missing)
+                + "\n\n请选择包含 model.onnx 与 tokens.txt 的目录。",
+                "模型缺失", wx.OK | wx.ICON_ERROR,
+            )
+            self.log(f"Model dir rejected (missing {', '.join(missing)}): {chosen}", "ERROR")
+            return
+
+        self.current_model_dir = chosen
+        tip = self._model_dir_tooltip()
+        self.lbl_model_dir.SetToolTip(tip)
+        self.btn_model_dir.SetToolTip(tip)
+        self.save_setting(MODEL_DIR_CONFIG_PATH, chosen)
+        # 目录变更后需重新加载模型
+        self.model = None
+        self.log(f"Model dir set to 模型目录已设为: {chosen}", "SUCCESS")
+
     def on_close(self, event):
-        """窗口关闭（v2 的异步线程等待 + v1 的完整清理）"""
+        """窗口关闭：保存设置并清理资源"""
         self.log("Closing window, saving settings and cleaning up resources... 正在关闭窗口，保存设置并清理资源...", "INFO")
 
-        # 保存所有配置
         self.save_setting(HOTKEY_FILE_PATH, self.current_hotkey)
-        self.save_setting(GTCRN_CONFIG_PATH, self.chk_gtcrn_enhance.IsChecked())
-        self.save_setting(SAVE_RECORDING_CONFIG_PATH, self.chk_save_recording.IsChecked())
+        self.save_setting(MODEL_DIR_CONFIG_PATH, self.current_model_dir)
+        self.save_setting(MONITOR_CONFIG_PATH, self.chk_monitor.IsChecked())
         self.save_setting(OPENCC_ENABLED_PATH, self.chk_opencc.IsChecked())
         self.save_setting(OPENCC_CONFIG_PATH, self.combo_opencc.GetValue())
-        self.save_setting(ENGINE_CONFIG_PATH, self.current_engine)
 
-        # 停止监听
         self.listening_event.clear()
         if self.listener_thread and self.listener_thread.is_alive():
             self.listener_thread.join(timeout=1.0)
 
-        # 等待后台保存线程完成（最多等 2 秒）
-        for worker in self._save_threads:
-            if worker.is_alive():
-                worker.join(timeout=2.0)
-
-        # 释放键盘钩子
         if KEYBOARD_AVAILABLE:
             try:
                 keyboard.unhook_all()
@@ -936,7 +1088,7 @@ class MyFrame(wx.Frame):
         self.Destroy()
 
     def on_set_hotkey(self, event):
-        """开始捕获热键（保留 v1 的独立线程属性，便于追踪）"""
+        """开始捕获热键"""
         if self.capturing_hotkey_event.is_set():
             return
         self.capturing_hotkey_event.set()
@@ -946,7 +1098,6 @@ class MyFrame(wx.Frame):
         self.capture_thread.start()
 
     def capture_hotkey_thread_func(self):
-        """热键捕获线程（v1 完整日志）"""
         try:
             new_hotkey = keyboard.read_hotkey(suppress=False)
             if len(new_hotkey) > 30:
@@ -961,36 +1112,8 @@ class MyFrame(wx.Frame):
             self.capturing_hotkey_event.clear()
             wx.CallAfter(self.update_ui_state)
 
-    def on_combo_select(self, event):
-        self.engine_languages[self.current_engine] = self.combo_box.GetValue()
-        self.current_language = self.combo_box.GetValue()
-        self.log(f"Language preference set to 语言偏好已设为: '{self.current_language}'", "INFO")
-
-    def on_engine_select(self, event):
-        """切换语音识别引擎（切换时清空已加载模型，下次启动时重新加载）"""
-        new_engine = self.combo_engine.GetValue()
-        if new_engine == self.current_engine:
-            return
-        missing = self._missing_engine_files(new_engine)
-        if missing:
-            self.log(f"Engine '{new_engine}' model files missing: {', '.join(missing)} 引擎 '{new_engine}' 模型文件缺失: {', '.join(missing)}", "ERROR")
-            wx.MessageBox(
-                "语音识别引擎 '" + new_engine + "' 模型文件缺失：\n\n"
-                + "\n".join(missing)
-                + "\n\n请将模型放入 assets/" + new_engine + " 目录。",
-                "模型缺失", wx.OK | wx.ICON_ERROR,
-            )
-            self.combo_engine.SetValue(self.current_engine)
-            return
-        self.current_engine = new_engine
-        self.engine_languages[new_engine] = self.combo_box.GetValue()
-        self.current_language = self.engine_languages[new_engine]
-        self.combo_box.SetItems(ENGINE_LANGUAGES[new_engine])
-        self.combo_box.SetValue(self.current_language)
-        self.save_setting(ENGINE_CONFIG_PATH, self.current_engine)
-        self.model = None
-        engine_display = "Qwen3-ASR" if new_engine == ENGINE_QWEN3_ASR else "SenseVoice"
-        self.log(f"ASR engine switched to ASR 引擎已切换为: '{engine_display}', language: {self.current_language}", "INFO")
+    def on_language_select(self, event):
+        self.log(f"Language preference set to 语言偏好已设为: '{self.combo_box.GetValue()}'", "INFO")
 
     def on_opencc_toggle(self, event):
         self.combo_opencc.Enable(self.chk_opencc.IsChecked())
@@ -1013,64 +1136,39 @@ class MyFrame(wx.Frame):
             self.log("Log copied to clipboard. 日志已复制到剪贴板。", "SUCCESS")
 
     # ------------------------------------------------------------
-    # 文本输出与处理
+    # 文本处理与输出
     # ------------------------------------------------------------
     def type_text(self, text_to_type):
-        """模拟键盘输入（v1 完整日志 + 各平台适配）"""
+        """用 SendInput 一次性把整段文本注入光标位置（含 Unicode / emoji）"""
         if not text_to_type:
             return
         try:
-            if sys.platform == "win32":
-                keyboard.write(text_to_type)
-                self.log(f"Keyboard typed 键盘输出: '{text_to_type}'", "SUCCESS")
-
-            elif sys.platform.startswith("linux"):
-                original_clipboard = pyperclip.paste()
-                pyperclip.copy(text_to_type)
-                time.sleep(0.05)
-                keyboard.press_and_release("shift+insert")
-                time.sleep(0.05)
-                pyperclip.copy(original_clipboard)
-                self.log(f"Linux keyboard typed Linux 键盘输出: '{text_to_type}'", "SUCCESS")
-
-            elif sys.platform == "darwin":
-                original_clipboard = pyperclip.paste()
-                pyperclip.copy(text_to_type)
-                time.sleep(0.05)
-                keyboard.press_and_release("command+v")
-                time.sleep(0.05)
-                pyperclip.copy(original_clipboard)
-                self.log(f"macOS keyboard typed macOS 键盘输出: '{text_to_type}'", "SUCCESS")
-
-            else:
-                keyboard.write(text_to_type)
-                self.log(f"Unknown OS keyboard typed 未知系统键盘输出: '{text_to_type}'", "SUCCESS")
-
-        except Exception as e:
+            send_unicode_text(text_to_type)
+            self.log(f"Keyboard typed 键盘输出: '{text_to_type}'", "SUCCESS")
+        except OSError as e:
+            # 目标窗口权限更高（以管理员运行）时 UIPI 会拦截 SendInput
             self.log(f"Keyboard input failed 键盘输入失败: {e}", "ERROR")
 
-    def process_text(self, text):
-        """文本清理：若标点数量 ≤1 则去除所有标点（v2 高效短路版）"""
-        if not text or not isinstance(text, str):
+    @staticmethod
+    def _apply_punct_rule(text):
+        """若标点数量 ≤1 则去除所有标点"""
+        if not text:
             return text
-
-        punct_count = 0
+        count = 0
         for char in text:
             if char in _PUNCTUATION_SET:
-                punct_count += 1
-                if punct_count > 1:
-                    return text   # 大于 1 个标点则保留原文本
-
-        # 只有 0 或 1 个标点时才移除
+                count += 1
+                if count > 1:
+                    return text
         return text.translate(_TRANSLATE_TABLE)
 
-    def sanitize_filename_part(self, text, max_len=MAX_FILENAME_TEXT_LEN):
-        """清理文件名中的非法字符（v2 预编译正则）"""
+    def process_text(self, text):
+        """文本清理：剥离 SenseVoice 停顿控制标记，再按标点规则清理。"""
         if not text or not isinstance(text, str):
-            return ""
-        sanitized = _RE_INVALID_CHARS.sub("", text)
-        sanitized = _RE_WHITESPACE.sub("_", sanitized).strip("_")
-        return sanitized[:max_len].strip("_") if len(sanitized) > max_len else sanitized
+            return text
+        if _PAUSE_MARKER in text:
+            text = _RE_PAUSE_MARKER.sub("", text)
+        return self._apply_punct_rule(text)
 
     # ------------------------------------------------------------
     # 休眠 / 唤醒处理
@@ -1094,18 +1192,19 @@ class MyFrame(wx.Frame):
     # 配置文件读写
     # ------------------------------------------------------------
     def load_setting(self, file_path, default_value):
-        """读取配置文件（v1 完整异常日志）"""
         try:
             if os.path.exists(file_path):
                 with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
+                    content = f.read()
+                    if file_path == MODEL_DIR_CONFIG_PATH:
+                        return content.strip()
+                    content = content.strip()
                     return content if content else default_value
         except Exception as e:
             self.log(f"Failed to load config file 读取配置文件 {os.path.basename(file_path)} 失败: {e}", "WARNING")
         return default_value
 
     def save_setting(self, file_path, value_to_save):
-        """写入配置文件（v1 完整异常日志）"""
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
@@ -1117,7 +1216,6 @@ class MyFrame(wx.Frame):
     # 辅助工具
     # ------------------------------------------------------------
     def _unblock_keys(self, keys):
-        """解除按键屏蔽（v1 去重逻辑）"""
         if not KEYBOARD_AVAILABLE:
             return
         seen = set()
@@ -1131,8 +1229,16 @@ class MyFrame(wx.Frame):
                 pass
 
 
-if __name__ == "__main__":
+def main():
+    if sys.platform != "win32":
+        print("sensevox only supports Windows.", file=sys.stderr)
+        return 1
     app = wx.App(False)
     frame = MyFrame()
     frame.Show()
     app.MainLoop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
